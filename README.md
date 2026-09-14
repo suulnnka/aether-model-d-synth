@@ -1,6 +1,6 @@
 # Aether Model D — 多 AI 实现对比
 
-同一个 PRD(见 `PRD.md`:网页 3D 复古模拟合成器,Three.js 渲染 + Web Audio API 发声)由多个 AI 各自独立实现,放在不同子目录里便于横向对比。每个子项目完全独立,互不共享依赖。
+网页 3D 复古模拟合成器(Three.js 渲染 + Web Audio API 发声)由多个 AI 各自独立实现,放在不同子目录里便于横向对比。每个子项目完全独立,互不共享依赖。
 
 ## 目录结构
 
@@ -9,6 +9,10 @@
 | `deepseek-v4.1-flash/` | DeepSeek v4.1 Flash 的实现(含 vitest 测试) |
 | `glm-5.3/` | GLM-5.3 的实现(含 vitest 测试) |
 | `hy4-preview/` | hy4-preview 的实现(含 Playwright 自检脚本) |
+
+## 在线预览
+
+**<https://suulnnka.github.io/aether-model-d-synth/>** — 落地页可进入三个子项目。
 
 ## 安装与启动
 
@@ -37,13 +41,8 @@ npm test           # deepseek-v4.1-flash / glm-5.3 有 vitest 单元测试
 
 - 三个子项目默认都用 5173 端口;同时启动多个时 Vite 会自动顺延到 5174、5175……以终端里实际打印的地址为准。
 - 浏览器要求音频由用户手势触发:打开页面后点击任意位置才能出声。
-- `hy4-preview/` 里另有 `verify*.cjs` / `shot*.png` 等生成时的自检脚本与截图,不影响运行。
 
 ## GitHub Pages 部署
 
-仓库自带流水线 [`.github/workflows/deploy-pages.yml`](.github/workflows/deploy-pages.yml):push 到 `master`(或手动触发)时依次安装并构建三个子项目,与根目录 `index.html` 落地页一起组装成站点发布到 GitHub Pages。
-
-- 落地页提供三个子项目的入口,各版本分别在 `/<仓库名>/<子项目>/` 路径下。
-- 三个子项目的 Vite 均使用 `base: "./"` 相对路径,构建产物可托管在任意子目录,无需额外配置。
-- 前提:仓库 Settings → Pages → Source 选择 **GitHub Actions**(首次部署前需手动设置一次)。
+push 到 `master` 时由 [`.github/workflows/deploy-pages.yml`](.github/workflows/deploy-pages.yml) 自动安装并构建三个子项目,连同根目录落地页一起发布到 GitHub Pages,各子项目分别位于 `/<子项目>/` 路径下。
 
