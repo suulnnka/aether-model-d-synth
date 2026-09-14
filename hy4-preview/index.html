@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" href="data:," />
+    <meta name="description" content="Aether Model D — 3D Web Synthesizer. 在浏览器中把玩的高保真 3D 复古单音合成器。" />
+    <meta property="og:title" content="Aether Model D — 3D Web Synthesizer" />
+    <meta property="og:description" content="可演奏的 3D 复古单音合成器:44 键、三振荡器、梯形低通滤波器,浏览器里即可转动每一颗旋钮。" />
+    <meta property="og:type" content="website" />
+    <title>Aether Model D — 3D Web Synthesizer</title>
+    <style>
+      #boot-loading {
+        position: fixed;
+        inset: 0;
+        background: #101014;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 18px;
+        z-index: 999;
+        transition: opacity 0.5s ease;
+        font-family: "Segoe UI", system-ui, sans-serif;
+      }
+      #boot-loading.done {
+        opacity: 0;
+        pointer-events: none;
+      }
+      #boot-loading .brand {
+        color: #d8d2c8;
+        font-size: 22px;
+        letter-spacing: 0.5em;
+        text-indent: 0.5em;
+        font-weight: 300;
+      }
+      #boot-loading .brand small {
+        display: block;
+        text-align: center;
+        font-size: 11px;
+        letter-spacing: 0.3em;
+        color: #7a756c;
+        margin-top: 6px;
+      }
+      #boot-bar {
+        width: 220px;
+        height: 3px;
+        background: #26262c;
+        border-radius: 2px;
+        overflow: hidden;
+      }
+      #boot-bar i {
+        display: block;
+        height: 100%;
+        width: 30%;
+        background: #e08a3c;
+        border-radius: 2px;
+        animation: bootslide 1.1s ease-in-out infinite;
+      }
+      @keyframes bootslide {
+        0% { transform: translateX(-110%); }
+        100% { transform: translateX(760%); }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="boot-loading">
+      <div class="brand">AETHER<small>MODEL D</small></div>
+      <div id="boot-bar"><i></i></div>
+    </div>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

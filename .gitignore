@@ -1,0 +1,32 @@
+# PRD 与参考资料不纳入版本控制
+PRD.md
+prompt.txt
+ref/
+
+# 依赖
+node_modules/
+
+# 构建产物
+dist/
+
+# 日志
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# 环境变量
+.env
+.env.*
+!.env.example
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# AI 工具本地目录
+.workbuddy/

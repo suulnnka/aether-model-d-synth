@@ -1,0 +1,170 @@
+/* Aether Model D — 覆盖层样式(可聚焦 DOM,对比度 ≥ 4.5:1) */
+
+html, body {
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  background: #0c0d10;
+  font-family: "Segoe UI", system-ui, sans-serif;
+  color: #e8e4da;
+}
+
+#app {
+  position: fixed;
+  inset: 0;
+}
+
+canvas.webgl {
+  display: block;
+  touch-action: none;
+}
+
+/* ---------- 覆盖层容器 ---------- */
+#app > div:not(.aether-layer) { pointer-events: none; }
+
+.aether-topright {
+  position: fixed;
+  top: 14px;
+  right: 14px;
+  display: flex;
+  gap: 8px;
+  z-index: 20;
+}
+
+.aether-bottomleft {
+  position: fixed;
+  left: 14px;
+  bottom: 14px;
+  z-index: 20;
+}
+
+.aether-btn {
+  appearance: none;
+  border: 1px solid rgba(230, 226, 216, 0.35);
+  background: rgba(20, 21, 25, 0.82);
+  color: #ece8dd;
+  font: 500 13px/1 "Segoe UI", system-ui, sans-serif;
+  padding: 8px 14px;
+  border-radius: 8px;
+  cursor: pointer;
+  backdrop-filter: blur(6px);
+  transition: background 0.15s ease, border-color 0.15s ease;
+  min-width: 34px;
+  min-height: 34px;
+}
+.aether-btn:hover, .aether-btn:focus-visible {
+  background: rgba(224, 138, 60, 0.25);
+  border-color: rgba(224, 138, 60, 0.7);
+  outline: none;
+}
+
+.aether-badge {
+  position: fixed;
+  top: 14px;
+  left: 14px;
+  z-index: 20;
+  background: rgba(120, 70, 10, 0.85);
+  color: #ffe9d0;
+  font: 500 12px/1 "Segoe UI", sans-serif;
+  padding: 7px 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 170, 90, 0.5);
+}
+
+/* ---------- Tooltip ---------- */
+.aether-tooltip {
+  position: fixed;
+  z-index: 30;
+  display: none;
+  pointer-events: none;
+  background: rgba(15, 16, 20, 0.92);
+  border: 1px solid rgba(230, 226, 216, 0.25);
+  color: #f0ece1;
+  font: 500 12px/1.4 "Segoe UI", sans-serif;
+  padding: 5px 9px;
+  border-radius: 6px;
+  white-space: nowrap;
+}
+
+/* ---------- 帮助 ---------- */
+.aether-help {
+  position: fixed;
+  left: 50%;
+  bottom: 60px;
+  transform: translateX(-50%);
+  width: min(560px, 92vw);
+  max-height: 70vh;
+  overflow: auto;
+  z-index: 40;
+  background: rgba(18, 19, 23, 0.95);
+  border: 1px solid rgba(230, 226, 216, 0.25);
+  border-radius: 14px;
+  padding: 20px 24px;
+  backdrop-filter: blur(10px);
+}
+.aether-help h2 { margin: 0 0 10px; font-size: 17px; letter-spacing: 0.05em; color: #f2eee2; }
+.aether-help h3 { margin: 14px 0 6px; font-size: 13px; color: #e0a35c; text-transform: uppercase; letter-spacing: 0.12em; }
+.aether-help ul { margin: 0; padding-left: 18px; font-size: 13px; line-height: 1.75; color: #cfcbc0; }
+.aether-help code {
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 12px;
+}
+.aether-help-actions { display: flex; gap: 8px; margin-top: 16px; }
+
+/* ---------- 首次引导 ---------- */
+.aether-guide {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding-bottom: 12vh;
+  background: rgba(5, 6, 8, 0.35);
+}
+.aether-guide-card {
+  background: rgba(20, 21, 26, 0.96);
+  border: 1px solid rgba(224, 138, 60, 0.45);
+  border-radius: 14px;
+  padding: 22px 28px;
+  text-align: center;
+  max-width: 420px;
+  font-size: 14px;
+  line-height: 2;
+  color: #e8e4da;
+}
+.aether-guide-card b { color: #f2eee2; letter-spacing: 0.08em; }
+.aether-guide-card p { margin: 10px 0 16px; }
+
+/* ---------- 声音激活提示 ---------- */
+.aether-soundhint {
+  position: fixed;
+  left: 50%;
+  top: 58%;
+  transform: translate(-50%, -50%);
+  z-index: 45;
+  pointer-events: none; /* 不阻挡画布交互,声音激活由 window 监听 */
+  background: rgba(20, 21, 26, 0.92);
+  border: 1px solid rgba(224, 138, 60, 0.6);
+  color: #ffdba8;
+  font: 500 15px/1 "Segoe UI", sans-serif;
+  padding: 14px 22px;
+  border-radius: 999px;
+  animation: hintpulse 2s ease-in-out infinite;
+}
+@keyframes hintpulse {
+  0%, 100% { opacity: 0.75; }
+  50% { opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .aether-soundhint { animation: none; }
+}
+
+/* hidden 属性不被 flex/display 覆盖 */
+.aether-guide[hidden],
+.aether-soundhint[hidden],
+.aether-help[hidden] {
+  display: none !important;
+}

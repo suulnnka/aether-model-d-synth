@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Aether Model D — 3D Web Synthesizer</title>
+    <meta
+      name="description"
+      content="Aether Model D — 浏览器里可演奏的 3D 复古单音模拟合成器：三振荡器、梯形低通滤波器、双包络，旋钮与琴键全程真实可操作。"
+    />
+    <meta name="theme-color" content="#0b0b0d" />
+    <meta name="color-scheme" content="dark" />
+
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="Aether Model D — 3D Web Synthesizer" />
+    <meta
+      property="og:description"
+      content="浏览器里可演奏的 3D 复古单音模拟合成器。掀开面板、转动旋钮、按下琴键，声音由实时建模的模拟合成引擎产生。"
+    />
+    <meta property="og:site_name" content="Aether Model D" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Aether Model D — 3D Web Synthesizer" />
+    <meta
+      name="twitter:description"
+      content="浏览器里可演奏的 3D 复古单音模拟合成器。"
+    />
+
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23151418'/%3E%3Cpath d='M6 21h4.5l3-10 3 10h4l2.5-7' stroke='%23ff8a3d' stroke-width='2.2' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <div id="app">
+      <!-- WebGL canvas host -->
+      <div id="stage" aria-hidden="true"></div>
+
+      <!-- Loading / boot screen (PRD 9: branded progress bar) -->
+      <div id="boot" role="status" aria-live="polite">
+        <div class="boot__plate">
+          <div class="boot__brand">
+            <span class="boot__brand-main">AETHER</span>
+            <span class="boot__brand-sub">Model&nbsp;D</span>
+          </div>
+          <div class="boot__type">Analog Monophonic Synthesizer</div>
+          <div class="boot__bar"><i id="boot-fill"></i></div>
+          <div class="boot__status" id="boot-status">正在初始化&#8230;</div>
+        </div>
+      </div>
+
+      <!-- Fatal error surface: never a blank white page (PRD 9 robustness) -->
+      <div id="fatal" hidden>
+        <div class="fatal__box">
+          <h1>无法启动</h1>
+          <p id="fatal-message"></p>
+          <button type="button" id="fatal-reload">重新加载</button>
+        </div>
+      </div>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
