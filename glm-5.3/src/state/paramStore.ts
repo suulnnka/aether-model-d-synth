@@ -14,7 +14,8 @@ export interface StorageLike {
   removeItem(key: string): void;
 }
 
-const STORE_KEY = "aether-model-d/v1";
+// 三个实现同域部署在 GitHub Pages 上,localStorage 按域共享:键名必须带项目前缀,避免互相污染。
+const STORE_KEY = "aether-model-d/glm-5.3/v1";
 const PERSIST_DEBOUNCE_MS = 300;
 
 /**

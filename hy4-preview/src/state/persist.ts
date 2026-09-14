@@ -3,7 +3,8 @@
  */
 import type { ParamStore } from "./params";
 
-const KEY = "aether-model-d.v1";
+// 三个实现同域部署在 GitHub Pages 上,localStorage 按域共享:键名必须带项目前缀,避免互相污染。
+const KEY = "aether-model-d/hy4-preview/v1";
 
 export interface PersistedState {
   params: Record<string, number>;

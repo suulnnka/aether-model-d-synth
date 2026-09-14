@@ -12,7 +12,8 @@
 
 import type { ParamState } from './ParamStore.ts';
 
-const STORAGE_KEY = 'aether-model-d/v1';
+// 三个实现同域部署在 GitHub Pages 上,localStorage 按域共享:键名必须带项目前缀,避免互相污染。
+const STORAGE_KEY = 'aether-model-d/deepseek-v4.1-flash/v1';
 const SCHEMA_VERSION = 1;
 const WRITE_DEBOUNCE_MS = 250;
 
