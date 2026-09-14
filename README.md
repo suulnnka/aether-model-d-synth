@@ -38,3 +38,12 @@ npm test           # deepseek-v4.1-flash / glm-5.3 有 vitest 单元测试
 - 三个子项目默认都用 5173 端口;同时启动多个时 Vite 会自动顺延到 5174、5175……以终端里实际打印的地址为准。
 - 浏览器要求音频由用户手势触发:打开页面后点击任意位置才能出声。
 - `hy4-preview/` 里另有 `verify*.cjs` / `shot*.png` 等生成时的自检脚本与截图,不影响运行。
+
+## GitHub Pages 部署
+
+仓库自带流水线 [`.github/workflows/deploy-pages.yml`](.github/workflows/deploy-pages.yml):push 到 `master`(或手动触发)时依次安装并构建三个子项目,与根目录 `index.html` 落地页一起组装成站点发布到 GitHub Pages。
+
+- 落地页提供三个子项目的入口,各版本分别在 `/<仓库名>/<子项目>/` 路径下。
+- 三个子项目的 Vite 均使用 `base: "./"` 相对路径,构建产物可托管在任意子目录,无需额外配置。
+- 前提:仓库 Settings → Pages → Source 选择 **GitHub Actions**(首次部署前需手动设置一次)。
+

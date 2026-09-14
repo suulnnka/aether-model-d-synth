@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Aether Model D — 多 AI 实现对比</title>
+  <style>
+    :root {
+      --bg: #14120f;
+      --panel: #1e1a15;
+      --edge: #3a3228;
+      --text: #e8e2d6;
+      --muted: #9a8f7d;
+      --amber: #e8a33d;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      background:
+        radial-gradient(ellipse 80% 50% at 50% -10%, rgba(232, 163, 61, 0.12), transparent),
+        var(--bg);
+      color: var(--text);
+      font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+      padding: 48px 24px;
+    }
+    header { text-align: center; margin-bottom: 40px; }
+    h1 {
+      font-size: 2rem;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+    h1 .model-d { color: var(--amber); }
+    header p { margin-top: 12px; color: var(--muted); font-size: 0.95rem; line-height: 1.7; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 20px;
+      width: 100%;
+      max-width: 900px;
+    }
+    a.card {
+      display: block;
+      background: var(--panel);
+      border: 1px solid var(--edge);
+      border-radius: 12px;
+      padding: 24px;
+      text-decoration: none;
+      color: var(--text);
+      transition: transform 0.15s ease, border-color 0.15s ease;
+    }
+    a.card:hover {
+      transform: translateY(-4px);
+      border-color: var(--amber);
+    }
+    .card h2 { font-size: 1.15rem; margin-bottom: 4px; }
+    .card .tag {
+      display: inline-block;
+      font-size: 0.72rem;
+      color: var(--amber);
+      border: 1px solid var(--amber);
+      border-radius: 999px;
+      padding: 2px 10px;
+      margin-bottom: 12px;
+      letter-spacing: 0.05em;
+    }
+    .card p { color: var(--muted); font-size: 0.88rem; line-height: 1.6; }
+    .card .go { display: inline-block; margin-top: 14px; color: var(--amber); font-size: 0.88rem; }
+    footer { margin-top: 44px; color: var(--muted); font-size: 0.8rem; text-align: center; line-height: 1.8; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Aether <span class="model-d">Model D</span></h1>
+    <p>同一份 PRD,多个 AI 各自独立实现的网页 3D 复古模拟合成器<br />(Three.js 渲染 + Web Audio API 发声)· 点击卡片进入对应版本</p>
+  </header>
+
+  <main class="grid">
+    <a class="card" href="./deepseek-v4.1-flash/">
+      <span class="tag">DeepSeek v4.1 Flash</span>
+      <h2>deepseek-v4.1-flash</h2>
+      <p>含 AudioWorklet 梯形滤波器与 vitest 单元测试(DSP / 布局 / 键盘映射)。</p>
+      <span class="go">进入 →</span>
+    </a>
+    <a class="card" href="./glm-5.3/">
+      <span class="tag">GLM-5.3</span>
+      <h2>glm-5.3</h2>
+      <p>铰链式可掀面板,44 键可演奏键盘,附 vitest 逻辑测试与 ?selftest 离线音频自检。</p>
+      <span class="go">进入 →</span>
+    </a>
+    <a class="card" href="./hy4-preview/">
+      <span class="tag">hy4-preview</span>
+      <h2>hy4-preview</h2>
+      <p>2D / 3D 双视图预览,附 Playwright 自检脚本。</p>
+      <span class="go">进入 →</span>
+    </a>
+  </main>
+
+  <footer>
+    浏览器要求音频由用户手势触发:进入各版本后点击页面任意位置即可出声。<br />
+    参考资料与需求文档(PRD.md、ref/)不在版本库内。
+  </footer>
+</body>
+</html>

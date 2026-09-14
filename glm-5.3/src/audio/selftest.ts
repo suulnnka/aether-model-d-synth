@@ -113,7 +113,7 @@ export async function runSelfTest(): Promise<SelfTestCase[]> {
     const sr = 44100;
     const ampOf = async (f: number): Promise<number> => {
       const ctx = new OfflineAudioContext(1, sr, sr);
-      await ctx.audioWorklet.addModule(`${location.origin}${import.meta.env.BASE_URL}audio/ladder-worklet.js`);
+      await ctx.audioWorklet.addModule(`${import.meta.env.BASE_URL}audio/ladder-worklet.js`);
       const node = new AudioWorkletNode(ctx, "aether-ladder-filter", {
         numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1],
       });
