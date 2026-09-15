@@ -1,134 +1,219 @@
+/**
+ * 渲染舞台(PRD §7):摄影棚式单一场景 —— 台面 + 无缝弯折背景幕、
+ * IBL(RoomEnvironment PMREM)、三点布光 + 软阴影、ACES 色调映射、
+ * 后处理链(Bloom / 暗角+颗粒 / SMAA)。
+ */
 import * as THREE from "three";
-import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js";
 import { EffectComposer } from "three/examples/jsm/postprocessing/EffectComposer.js";
 import { RenderPass } from "three/examples/jsm/postprocessing/RenderPass.js";
 import { UnrealBloomPass } from "three/examples/jsm/postprocessing/UnrealBloomPass.js";
 import { ShaderPass } from "three/examples/jsm/postprocessing/ShaderPass.js";
+import { SMAAPass } from "three/examples/jsm/postprocessing/SMAAPass.js";
 import { OutputPass } from "three/examples/jsm/postprocessing/OutputPass.js";
-import { VignetteShader } from "three/examples/jsm/shaders/VignetteShader.js";
-import { studioBackground } from "../model/textures";
+import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js";
+import { grainTexture, woodTexture } from "../model/textures";
 
-/**
- * 舞台(VIS-1/2/3/5):PBR + IBL、ACESFilmic、三点布光软阴影、
- * 摄影棚背景、轻微 Bloom(电源灯自发光)与暗角后期。
- */
+/** 暗角 + 细颗粒(VIS-9 / VIS-14;不改变材质色彩) */
+const VignetteGrainShader = {
+  uniforms: {
+    tDiffuse: { value: null as THREE.Texture | null },
+    uStrength: { value: 0.42 },
+    uGrain: { value: 0.028 },
+    uTime: { value: 0 },
+  },
+  vertexShader: /* glsl */ `
+    varying vec2 vUv;
+    void main() {
+      vUv = uv;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }
+  `,
+  fragmentShader: /* glsl */ `
+    uniform sampler2D tDiffuse;
+    uniform float uStrength;
+    uniform float uGrain;
+    uniform float uTime;
+    varying vec2 vUv;
+    float hash(vec2 p) {
+      return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
+    }
+    void main() {
+      vec4 color = texture2D(tDiffuse, vUv);
+      vec2 d = vUv - 0.5;
+      float vig = 1.0 - uStrength * dot(d, d) * 1.55;
+      color.rgb *= clamp(vig, 0.0, 1.0);
+      float g = (hash(vUv * 997.0 + fract(uTime) * 13.0) - 0.5) * uGrain;
+      color.rgb += g;
+      gl_FragColor = color;
+    }
+  `,
+};
 
 export interface Stage {
   scene: THREE.Scene;
+  camera: THREE.PerspectiveCamera;
   renderer: THREE.WebGLRenderer;
   composer: EffectComposer;
-  bloom: UnrealBloomPass;
-  keyLight: THREE.SpotLight;
-  resize(w: number, h: number): void;
-  render(): void;
-  setBloomEnabled(on: boolean): void;
+  vignettePass: ShaderPass;
+  resize(): void;
+  render(timeSec: number): void;
+  dispose(): void;
 }
 
-export function createStage(canvasHost: HTMLElement, synthRoot: THREE.Object3D): Stage {
+export function createStage(container: HTMLElement): Stage {
   const renderer = new THREE.WebGLRenderer({
-    antialias: true,
+    antialias: false,
     powerPreference: "high-performance",
   });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-  renderer.setSize(canvasHost.clientWidth, canvasHost.clientHeight);
-  renderer.shadowMap.enabled = true;
-  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-  renderer.toneMapping = THREE.ACESFilmicToneMapping;
-  renderer.toneMappingExposure = 0.95;
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2)); // VIS-8
+  renderer.setSize(container.clientWidth, container.clientHeight);
   renderer.outputColorSpace = THREE.SRGBColorSpace;
-  canvasHost.appendChild(renderer.domElement);
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.02;
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap; // VIS-7
+  container.appendChild(renderer.domElement);
 
   const scene = new THREE.Scene();
-  scene.background = studioBackground();
+  scene.fog = new THREE.FogExp2(0x0a0b0f, 0.055); // VIS-15 极轻雾效
 
-  // IBL 环境
+  const camera = new THREE.PerspectiveCamera(
+    38,
+    container.clientWidth / container.clientHeight,
+    0.02,
+    20,
+  );
+
+  /* ---- IBL(VIS-4 / VIS-5) ---- */
   const pmrem = new THREE.PMREMGenerator(renderer);
-  const envTex = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
-  scene.environment = envTex;
-  scene.environmentIntensity = 0.38;
+  const envScene = new RoomEnvironment();
+  const envMap = pmrem.fromScene(envScene, 0.04).texture;
+  scene.environment = envMap;
+  scene.environmentIntensity = 0.30;
   pmrem.dispose();
 
-  // ---- 三点布光 ----
-  // 主光:暖色,带软阴影
-  const keyLight = new THREE.SpotLight(0xffe2bd, 13, 6, 0.55, 0.65, 1.2);
-  keyLight.position.set(0.9, 1.5, 0.8);
-  keyLight.castShadow = true;
-  keyLight.shadow.mapSize.set(2048, 2048);
-  keyLight.shadow.bias = -0.0002;
-  keyLight.shadow.normalBias = 0.006;
-  keyLight.shadow.radius = 6;
-  keyLight.shadow.camera.near = 0.2;
-  keyLight.shadow.camera.far = 4;
-  scene.add(keyLight);
-  scene.add(keyLight.target);
+  /* ---- 背景:无缝弯折幕(Lathe 旋成无限远背景墙)+ 台面 ---- */
+  const profile: THREE.Vector2[] = [
+    new THREE.Vector2(1.35, -0.05),
+    new THREE.Vector2(1.33, 0.02),
+    new THREE.Vector2(1.28, 0.25),
+    new THREE.Vector2(1.18, 0.55),
+    new THREE.Vector2(1.04, 0.85),
+    new THREE.Vector2(0.92, 1.15),
+    new THREE.Vector2(0.86, 1.5),
+  ];
+  const cycGeo = new THREE.LatheGeometry(profile, 64);
+  // 渐变 + 颗粒贴图
+  const gradCanvas = document.createElement("canvas");
+  gradCanvas.width = 4;
+  gradCanvas.height = 256;
+  const gctx = gradCanvas.getContext("2d")!;
+  const grad = gctx.createLinearGradient(0, 0, 0, 256);
+  grad.addColorStop(0, "#050608");
+  grad.addColorStop(0.45, "#141821");
+  grad.addColorStop(0.75, "#1c2230");
+  grad.addColorStop(1, "#07080b");
+  gctx.fillStyle = grad;
+  gctx.fillRect(0, 0, 4, 256);
+  const gradTex = new THREE.CanvasTexture(gradCanvas);
+  gradTex.colorSpace = THREE.SRGBColorSpace;
+  const cycMat = new THREE.MeshStandardMaterial({
+    map: gradTex,
+    roughnessMap: grainTexture(),
+    roughness: 1,
+    metalness: 0,
+    side: THREE.DoubleSide,
+    envMapIntensity: 0.15,
+  });
+  const cyclorama = new THREE.Mesh(cycGeo, cycMat);
+  cyclorama.position.y = -0.045;
+  scene.add(cyclorama);
 
-  // 补光:冷色,低强度
-  const fill = new THREE.DirectionalLight(0x8fb0e8, 0.3);
-  fill.position.set(-1.2, 0.7, 0.5);
-  scene.add(fill);
-
-  // 轮廓光
-  const rim = new THREE.SpotLight(0xd8e4ff, 4, 6, 0.7, 0.8, 1.5);
-  rim.position.set(-0.6, 1.0, -1.4);
-  scene.add(rim);
-
-  // 极弱环境底光
-  scene.add(new THREE.HemisphereLight(0x2a2c33, 0x0a0a0c, 0.35));
-
-  // ---- 台面(VIS-3:哑光台面,接受投影与轻微反射感)----
+  // 台面:深胡桃木桌(VIS-13)
+  const tableTex = woodTexture(true);
+  tableTex.repeat.set(2.2, 1.1);
   const table = new THREE.Mesh(
-    new THREE.CircleGeometry(2.2, 48),
-    new THREE.MeshStandardMaterial({
-      color: 0x141519,
-      metalness: 0.55,
-      roughness: 0.42,
-    })
+    new THREE.CylinderGeometry(1.32, 1.32, 0.05, 64),
+    new THREE.MeshPhysicalMaterial({
+      color: 0x6b5138,
+      map: tableTex,
+      roughness: 0.5,
+      metalness: 0.0,
+      clearcoat: 0.18,
+      clearcoatRoughness: 0.5,
+      envMapIntensity: 0.22,
+    }),
   );
-  table.rotation.x = -Math.PI / 2;
-  table.position.y = -0.002;
+  table.position.y = -0.037; // 顶面 y=-0.012,与底脚贴合
   table.receiveShadow = true;
   scene.add(table);
 
-  scene.add(synthRoot);
+  /* ---- 三点布光(VIS-6) ---- */
+  const key = new THREE.SpotLight(0xffdfb8, 42, 4.5, Math.PI / 5.2, 0.45, 1.6);
+  key.position.set(-0.85, 1.35, 0.95);
+  key.castShadow = true;
+  key.shadow.mapSize.set(2048, 2048);
+  key.shadow.bias = -0.00018;
+  key.shadow.normalBias = 0.015;
+  key.shadow.camera.near = 0.3;
+  key.shadow.camera.far = 4;
+  const keyTarget = new THREE.Object3D();
+  keyTarget.position.set(0, 0.06, 0.02);
+  scene.add(keyTarget);
+  key.target = keyTarget;
+  scene.add(key);
 
-  // ---- 后期:Bloom(仅高亮自发光)+ 暗角 ----
-  const size = new THREE.Vector2();
-  renderer.getSize(size);
-  const rt = new THREE.WebGLRenderTarget(size.x * renderer.getPixelRatio(), size.y * renderer.getPixelRatio(), {
-    samples: 4,
-    type: THREE.HalfFloatType,
-  });
-  const composer = new EffectComposer(renderer, rt);
-  composer.addPass(new RenderPass(scene, null!));
-  const bloom = new UnrealBloomPass(size.clone(), 0.2, 0.4, 1.05);
+  const fill = new THREE.DirectionalLight(0xa8c4ff, 0.85); // 冷补光,无阴影
+  fill.position.set(0.9, 0.75, 0.55);
+  scene.add(fill);
+
+  const rim = new THREE.DirectionalLight(0xdfe8ff, 1.35); // 轮廓光,后方高角度
+  rim.position.set(0.15, 1.5, -1.1);
+  scene.add(rim);
+
+  scene.add(new THREE.HemisphereLight(0x33383f, 0x0b0a09, 0.5));
+
+  /* ---- 后处理链(VIS-9) ---- */
+  const composer = new EffectComposer(renderer);
+  composer.addPass(new RenderPass(scene, camera));
+  const bloom = new UnrealBloomPass(
+    new THREE.Vector2(container.clientWidth, container.clientHeight),
+    0.34, // strength:仅 LED / Overload 等高亮自发光起辉
+    0.5,
+    0.86,
+  );
   composer.addPass(bloom);
-  const vignette = new ShaderPass(VignetteShader);
-  vignette.uniforms.offset.value = 1.15;
-  vignette.uniforms.darkness.value = 1.05;
-  composer.addPass(vignette);
+  const vignettePass = new ShaderPass(VignetteGrainShader);
+  composer.addPass(vignettePass);
+  const smaa = new SMAAPass();
+  composer.addPass(smaa);
   composer.addPass(new OutputPass());
-  // RenderPass 的相机由 app 在相机就绪后注入
-  const stage: Stage = {
+
+  const resize = () => {
+    const w = container.clientWidth;
+    const h = container.clientHeight;
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
+    renderer.setSize(w, h);
+    composer.setSize(w, h);
+  };
+  window.addEventListener("resize", resize);
+
+  return {
     scene,
+    camera,
     renderer,
     composer,
-    bloom,
-    keyLight,
-    resize(w, h) {
-      renderer.setSize(w, h);
-      composer.setSize(w, h);
-    },
-    render() {
+    vignettePass,
+    resize,
+    render(timeSec) {
+      vignettePass.uniforms.uTime.value = timeSec;
       composer.render();
     },
-    setBloomEnabled(on: boolean) {
-      bloom.enabled = on;
+    dispose() {
+      window.removeEventListener("resize", resize);
+      renderer.dispose();
+      container.removeChild(renderer.domElement);
     },
   };
-  return stage;
-}
-
-/** 为 RenderPass 绑定相机 */
-export function bindCamera(stage: Stage, camera: THREE.Camera): void {
-  (stage.composer.passes[0] as RenderPass).camera = camera;
 }

@@ -1,147 +1,336 @@
-import * as THREE from "three";
-import type { MaterialLib } from "./materials";
-
 /**
- * 面板控件 3D 工厂(MDL-2):
- * knob = 圆柱旋钮 + 指针刻线
- * selector = 旋钮 + 裙边 + 裙边指针(波形/音域档位)
- * switch-v/h = 翘板开关(通断两个姿态)
- * 每个控件附带 hover 高亮环与 raycast 命中体。
+ * 面板控件 3D 工厂(MDL-2):圆柱旋钮(指针刻线)、带裙边档位旋钮、
+ * 拨杆开关、电源跷板、A-440 按钮、指示灯、竖向滑轮(滚花)。
+ * 每个控件带不可见拾取体与悬停高亮环,userData.pick 供 raycast 命中。
  */
+import * as THREE from "three";
+import type { MaterialLibrary } from "./materials";
+import type { Val } from "../state/paramStore";
 
-export interface ControlVisual {
+export type PickKind = "knob" | "selector" | "switch" | "button" | "wheel";
+
+export interface PickInfo {
+  kind: PickKind;
+  paramId: string;
+}
+
+export interface CtrlPos {
+  x: number;
+  v: number;
+}
+
+export interface ControlHandle {
   group: THREE.Group;
-  kind: "knob" | "selector" | "switch-v" | "switch-h";
-  /** 旋钮/裙边(旋转) */
-  rotator?: THREE.Object3D;
-  /** 开关翘板(俯仰) */
-  rocker?: THREE.Object3D;
-  /** 高亮环 */
-  halo: THREE.Mesh;
-  /** 档位数(switch=2) */
-  steps: number;
+  update(value: Val): void;
+  setHover(on: boolean): void;
 }
 
-function haloMesh(r: number): THREE.Mesh {
-  const g = new THREE.TorusGeometry(r, r * 0.12, 8, 32);
-  const m = new THREE.MeshBasicMaterial({
-    color: 0xffc35e,
-    transparent: true,
-    opacity: 0.85,
-    depthWrite: false,
-  });
-  const mesh = new THREE.Mesh(g, m);
-  mesh.rotation.x = -Math.PI / 2;
-  mesh.position.y = 0.0012;
-  mesh.visible = false;
-  mesh.renderOrder = 5;
-  return mesh;
-}
+const hitMaterial = new THREE.MeshBasicMaterial({ visible: false });
+const hoverMaterial = new THREE.MeshBasicMaterial({
+  color: 0xffb340,
+  transparent: true,
+  opacity: 0.85,
+});
 
-export function createKnob(d: number, mats: MaterialLib): ControlVisual {
-  const group = new THREE.Group();
-  const h = d * 0.62;
-  const body = new THREE.Mesh(new THREE.CylinderGeometry(d / 2, d / 2 * 0.94, h, 28), mats.knob);
-  body.position.y = h / 2;
-  const cap = new THREE.Mesh(new THREE.CylinderGeometry(d / 2 * 0.82, d / 2 * 0.82, h * 0.24, 28), mats.knobSkirt);
-  cap.position.y = h + h * 0.1;
-  // 指针刻线
-  const pointer = new THREE.Mesh(new THREE.BoxGeometry(d * 0.07, h * 0.5, d * 0.34), mats.pointer);
-  pointer.position.set(0, h + h * 0.16, d * 0.2);
-  const rotator = new THREE.Group();
-  rotator.add(body, cap, pointer);
-  group.add(rotator);
-  const halo = haloMesh(d * 0.62);
-  group.add(halo);
-  return { group, kind: "knob", rotator, halo, steps: 0 };
-}
-
-export function createSelector(d: number, mats: MaterialLib): ControlVisual {
-  const group = new THREE.Group();
-  const h = d * 0.5;
-  const skirtH = d * 0.16;
-  const skirt = new THREE.Mesh(
-    new THREE.CylinderGeometry(d / 2, d / 2 * 1.06, skirtH, 30),
-    mats.knobSkirt
-  );
-  skirt.position.y = skirtH / 2;
-  const body = new THREE.Mesh(new THREE.CylinderGeometry(d / 2 * 0.62, d / 2 * 0.58, h, 24), mats.knob);
-  body.position.y = skirtH + h / 2;
-  // 裙边指针(小三角刻线)
-  const pointer = new THREE.Mesh(new THREE.BoxGeometry(d * 0.05, skirtH * 0.7, d * 0.3), mats.pointer);
-  pointer.position.set(0, skirtH / 2, d * 0.42);
-  const rotator = new THREE.Group();
-  rotator.add(skirt, body, pointer);
-  group.add(rotator);
-  const halo = haloMesh(d * 0.66);
-  group.add(halo);
-  return { group, kind: "selector", rotator, halo, steps: 0 };
-}
-
-export function createRockerSwitch(
-  w: number,
+function attachPick(
+  mesh: THREE.Object3D,
+  kind: PickKind,
+  paramId: string,
+  r: number,
   h: number,
-  vertical: boolean,
-  mats: MaterialLib
-): ControlVisual {
+  yCenter: number,
+): THREE.Mesh {
+  const hit = new THREE.Mesh(new THREE.CylinderGeometry(r, r, h, 12), hitMaterial);
+  hit.position.y = yCenter;
+  hit.userData.pick = { kind, paramId } satisfies PickInfo;
+  mesh.add(hit);
+  return hit;
+}
+
+function addHoverRing(group: THREE.Group, r: number): THREE.Mesh {
+  const ring = new THREE.Mesh(
+    new THREE.TorusGeometry(r, 0.0012, 8, 40),
+    hoverMaterial,
+  );
+  ring.rotation.x = -Math.PI / 2;
+  ring.position.y = 0.0015;
+  ring.visible = false;
+  group.add(ring);
+  return ring;
+}
+
+/** 连续旋钮(INT-1):垂直拖动 / Shift 精调 / 滚轮微调 / 双击默认 */
+export function makeKnob(
+  mats: MaterialLibrary,
+  pos: CtrlPos,
+  paramId: string,
+  min: number,
+  max: number,
+  size = 1,
+): ControlHandle {
   const group = new THREE.Group();
-  // 底座圈
-  const base = new THREE.Mesh(
-    vertical
-      ? new THREE.BoxGeometry(w * 1.28, h * 0.24, w * 0.9)
-      : new THREE.BoxGeometry(h * 0.24, w * 0.9, w * 1.28),
-    mats.switchBody
-  );
-  base.position.y = 0.0008;
-  group.add(base);
+  group.position.set(pos.x, 0, pos.v);
+  const r = 0.0115 * size;
 
-  // 翘板:绕水平轴翻转;vertical 开关绕 x 轴,horizontal 绕 z 轴
-  const capLen = h * 0.86;
-  const cap = new THREE.Mesh(
-    vertical
-      ? new THREE.BoxGeometry(w * 0.92, capLen, w * 0.5)
-      : new THREE.BoxGeometry(capLen, w * 0.5, w * 0.92),
-    mats.switchCap
+  // 旋转体:帽身 + 指针
+  const spinner = new THREE.Group();
+  const cap = new THREE.Mesh(new THREE.CylinderGeometry(r, r * 1.06, 0.0135, 24), mats.knobCap);
+  cap.position.y = 0.0072;
+  // 顶面微凹细节:细环
+  const collar = new THREE.Mesh(new THREE.TorusGeometry(r * 0.82, 0.0011, 8, 24), mats.knobPointer);
+  collar.rotation.x = -Math.PI / 2;
+  collar.position.y = 0.0139;
+  const pointer = new THREE.Mesh(
+    new THREE.BoxGeometry(0.0016, 0.0016, r * 0.92),
+    mats.knobPointer,
   );
-  cap.position.y = w * 0.24;
-  const rocker = new THREE.Group();
-  rocker.add(cap);
-  group.add(rocker);
+  pointer.position.set(0, 0.0142, -r * 0.48);
+  spinner.add(cap, collar, pointer);
+  group.add(spinner);
 
-  const halo = haloMesh(Math.max(w, h) * 0.62);
-  group.add(halo);
+  attachPick(group, "knob", paramId, r + 0.004, 0.024, 0.008);
+  const ring = addHoverRing(group, r + 0.0045);
+
   return {
     group,
-    kind: vertical ? "switch-v" : "switch-h",
-    rocker,
-    halo,
-    steps: 2,
+    update(value) {
+      const norm = (Number(value) - min) / (max - min);
+      spinner.rotation.y = THREE.MathUtils.lerp(
+        (135 * Math.PI) / 180,
+        (-135 * Math.PI) / 180,
+        THREE.MathUtils.clamp(norm, 0, 1),
+      );
+    },
+    setHover(on) {
+      ring.visible = on;
+    },
   };
 }
 
-/** 开关姿态:0 = Off,1 = On(vertical:On 向后仰) */
-export function setSwitchPose(v: ControlVisual, value: number): void {
-  if (!v.rocker) return;
-  const on = value >= 0.5;
-  if (v.kind === "switch-v") {
-    v.rocker.rotation.x = on ? -0.42 : 0.42;
-  } else {
-    v.rocker.rotation.z = on ? -0.42 : 0.42;
-  }
+/** 档位旋钮(INT-2):裙边 + 指针;单击循环进档 */
+export function makeSelector(
+  mats: MaterialLibrary,
+  pos: CtrlPos,
+  paramId: string,
+  steps: readonly string[],
+): ControlHandle {
+  const group = new THREE.Group();
+  group.position.set(pos.x, 0, pos.v);
+  const r = 0.0165;
+
+  const spinner = new THREE.Group();
+  const skirt = new THREE.Mesh(
+    new THREE.CylinderGeometry(r, r * 1.1, 0.0075, 24),
+    mats.knobSkirt,
+  );
+  skirt.position.y = 0.0042;
+  const cap = new THREE.Mesh(
+    new THREE.CylinderGeometry(r * 0.62, r * 0.68, 0.009, 20),
+    mats.knobCap,
+  );
+  cap.position.y = 0.011;
+  const pointer = new THREE.Mesh(
+    new THREE.BoxGeometry(0.002, 0.0018, r * 0.95),
+    mats.knobPointer,
+  );
+  pointer.position.set(0, 0.016, -r * 0.5);
+  spinner.add(skirt, cap, pointer);
+  group.add(spinner);
+
+  attachPick(group, "selector", paramId, r + 0.0035, 0.026, 0.009);
+  const ring = addHoverRing(group, r + 0.004);
+
+  return {
+    group,
+    update(value) {
+      const idx = steps.indexOf(String(value));
+      const i = idx >= 0 ? idx : 0;
+      spinner.rotation.y = THREE.MathUtils.lerp(
+        (150 * Math.PI) / 180,
+        (-150 * Math.PI) / 180,
+        steps.length > 1 ? i / (steps.length - 1) : 0.5,
+      );
+    },
+    setHover(on) {
+      ring.visible = on;
+    },
+  };
 }
 
-/** 旋钮角度:归一化 0-1 → -135°..+135°(PRD 行程) */
-export function setKnobAngle(v: ControlVisual, norm: number): void {
-  if (!v.rotator) return;
-  const a = -Math.PI * 0.75 + norm * Math.PI * 1.5;
-  v.rotator.rotation.y = -a; // 顺时针为增
+/** 拨杆开关(INT-3):单击翻转,≤100ms 动画由交互层 tween */
+export function makeSwitch(
+  mats: MaterialLibrary,
+  pos: CtrlPos,
+  paramId: string,
+  color: "orange" | "blue",
+): ControlHandle {
+  const group = new THREE.Group();
+  group.position.set(pos.x, 0, pos.v);
+
+  const base = new THREE.Mesh(new THREE.BoxGeometry(0.0125, 0.0045, 0.0085), mats.switchBase);
+  base.position.y = 0.0022;
+  group.add(base);
+
+  const leverMat = color === "orange" ? mats.leverOrange : mats.leverBlue;
+  const lever = new THREE.Group();
+  const stem = new THREE.Mesh(new THREE.CylinderGeometry(0.0013, 0.0016, 0.0115, 10), leverMat);
+  stem.position.y = 0.0057;
+  const tip = new THREE.Mesh(new THREE.CapsuleGeometry(0.0021, 0.0055, 4, 10), leverMat);
+  tip.position.y = 0.0125;
+  lever.add(stem, tip);
+  group.add(lever);
+
+  attachPick(group, "switch", paramId, 0.011, 0.022, 0.008);
+  const ring = addHoverRing(group, 0.0125);
+
+  return {
+    group,
+    update(value) {
+      const on = Boolean(value);
+      lever.rotation.x = on ? 0.5 : -0.5;
+    },
+    setHover(on) {
+      ring.visible = on;
+    },
+  };
 }
 
-/** 选择器角度:step i/n → 均匀分布 */
-export function setSelectorAngle(v: ControlVisual, step: number, steps: number): void {
-  if (!v.rotator || steps < 2) return;
-  const a0 = -Math.PI * 0.72;
-  const a1 = Math.PI * 0.72;
-  const a = a0 + ((a1 - a0) * step) / (steps - 1);
-  v.rotator.rotation.y = -a;
+/** 电源跷板开关 */
+export function makeRocker(
+  mats: MaterialLibrary,
+  pos: CtrlPos,
+  paramId: string,
+): ControlHandle {
+  const group = new THREE.Group();
+  group.position.set(pos.x, 0, pos.v);
+
+  const frame = new THREE.Mesh(new THREE.BoxGeometry(0.019, 0.005, 0.026), mats.switchBase);
+  frame.position.y = 0.0025;
+  group.add(frame);
+  const paddle = new THREE.Mesh(
+    new THREE.BoxGeometry(0.0135, 0.004, 0.02),
+    mats.rocker,
+  );
+  paddle.position.y = 0.0062;
+  group.add(paddle);
+
+  attachPick(group, "switch", paramId, 0.016, 0.024, 0.008);
+  const ring = addHoverRing(group, 0.017);
+
+  return {
+    group,
+    update(value) {
+      paddle.rotation.x = Boolean(value) ? 0.22 : -0.22;
+      paddle.position.y = Boolean(value) ? 0.0075 : 0.005;
+    },
+    setHover(on) {
+      ring.visible = on;
+    },
+  };
+}
+
+/** A-440 按钮 */
+export function makePushButton(
+  mats: MaterialLibrary,
+  pos: CtrlPos,
+  paramId: string,
+): ControlHandle {
+  const group = new THREE.Group();
+  group.position.set(pos.x, 0, pos.v);
+  const bezel = new THREE.Mesh(new THREE.CylinderGeometry(0.0085, 0.0085, 0.003, 20), mats.switchBase);
+  bezel.position.y = 0.0018;
+  const cap = new THREE.Mesh(new THREE.CylinderGeometry(0.0062, 0.0062, 0.005, 20), mats.pushButton);
+  cap.position.y = 0.0045;
+  group.add(bezel, cap);
+
+  attachPick(group, "button", paramId, 0.0105, 0.012, 0.005);
+  const ring = addHoverRing(group, 0.0105);
+
+  return {
+    group,
+    update(value) {
+      const on = Boolean(value);
+      cap.position.y = on ? 0.0028 : 0.0045;
+    },
+    setHover(on) {
+      ring.visible = on;
+    },
+  };
+}
+
+/** 指示灯(LED / Overload;VIS-10 自发光 + Bloom) */
+export function makeLamp(
+  mats: MaterialLibrary,
+  pos: CtrlPos,
+  material: THREE.MeshStandardMaterial,
+): { group: THREE.Group; set(on: boolean): void } {
+  const group = new THREE.Group();
+  group.position.set(pos.x, 0, pos.v);
+  const bezel = new THREE.Mesh(new THREE.CylinderGeometry(0.0052, 0.0052, 0.0035, 16), mats.switchBase);
+  bezel.position.y = 0.0017;
+  const dome = new THREE.Mesh(
+    new THREE.SphereGeometry(0.0034, 14, 10, 0, Math.PI * 2, 0, Math.PI / 2),
+    material,
+  );
+  dome.position.y = 0.0033;
+  group.add(bezel, dome);
+  return {
+    group,
+    set(on) {
+      material.emissiveIntensity = on ? 3.2 : 0;
+    },
+  };
+}
+
+/** 竖向滑轮(INT-5):弯音(弹簧回中)/ 调制(保持) */
+export function makeWheel(
+  mats: MaterialLibrary,
+  pos: CtrlPos,
+  paramId: string,
+  min: number,
+  max: number,
+): ControlHandle {
+  const group = new THREE.Group();
+  group.position.set(pos.x, 0, pos.v);
+
+  const axle = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.0026, 0.0026, 0.009, 10),
+    mats.metalPart,
+  );
+  axle.rotation.z = Math.PI / 2;
+  axle.position.y = 0.004;
+  group.add(axle);
+
+  const wheel = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.0165, 0.0165, 0.0062, 28),
+    mats.wheel,
+  );
+  wheel.rotation.z = Math.PI / 2;
+  wheel.position.y = 0.0165;
+  // 轮面上的指示槽
+  const slot = new THREE.Mesh(
+    new THREE.BoxGeometry(0.0068, 0.0009, 0.020),
+    mats.knobPointer,
+  );
+  slot.position.y = 0.0166;
+  const spinner = new THREE.Group();
+  spinner.add(wheel, slot);
+  group.add(spinner);
+
+  attachPick(group, "wheel", paramId, 0.019, 0.036, 0.016);
+
+  return {
+    group,
+    update(value) {
+      const norm = (Number(value) - min) / (max - min);
+      spinner.rotation.x = THREE.MathUtils.lerp(
+        (-78 * Math.PI) / 180,
+        (78 * Math.PI) / 180,
+        THREE.MathUtils.clamp(norm, 0, 1),
+      );
+    },
+    setHover() {
+      /* 滑轮用指针样式变化即可 */
+    },
+  };
 }

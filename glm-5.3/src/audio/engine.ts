@@ -1,612 +1,731 @@
-import { glideSeconds } from "../state/params";
-import type { ParamStore } from "../state/paramStore";
-import { MonoKeyboard, type MonoEvent } from "./monoKeys";
-import { getWave, WAVE_NAMES } from "./waveforms";
-
 /**
- * Aether Model D 模拟合成引擎(PRD §5.6 / §8)。
+ * 声音引擎(PRD §10):常驻音频图 AUD-4 —— 引擎启动即建立完整音频图,
+ * noteOn/off 只触发包络与音高自动化。
  *
- * 信号图常驻:3×VCO → 混音 → 梯形低通(Worklet / 4 极 Biquad 降级)
- *   → VCA(响度包络)→ Volume → 软饱和 → 电源 → UI 静音 → 主输出
- * noteOn/off 只调度包络与音高自动化,不重建图(§8.1)。
- * 所有参数自动化用 setTargetAtTime 平滑,杜绝 zipper 噪声(INT-12)。
+ * 信号流:
+ *   Osc-1/2/3 ─On/Off─ 电平 ─┐
+ *   Noise(白/粉) ─电平───────┼→ 混音 → 梯形低通 Worklet → VCA(响度包络)
+ *   Ext-In(麦克风) ─电平─────┘                        ↓
+ *                              主音量 → 软饱和 → 电源 → Out
+ * 调制矩阵:源A = Osc.3 | Filter EG;源B = Noise | LFO;
+ *   Mod Mix 线性混合 → { Oscillator Mod ⇒ 三 VCO 音高 FM(深度=调制轮),
+ *                       Filter Mod ⇒ 截止 FM(Worklet fm 参数,八度) }
  */
+import type { ParamStore } from "../state/paramStore";
+import { RANGE_OCT } from "../state/paramStore";
+import { MonoKeyboard } from "./monoKeys";
+import { periodicWave, type WaveName } from "./waveforms";
+import {
+  clamp,
+  contourOctaves,
+  cutoffHz,
+  envSeconds,
+  FILTER_FM_OCTAVES,
+  glideSeconds,
+  kcOctaves,
+  loHz,
+  lfoHz,
+  masterGain,
+  mixerGain,
+  PITCH_FM_SEMITONES,
+  RELEASE_SECONDS,
+  resonance,
+} from "./mapping";
 
-const RANGE_MULT = [0.25, 0.5, 1, 2, 4]; // 32' 16' 8' 4' 2'
-const LO_BASE_HZ = 2.5; // Osc-3 LO 档中心频率(Frequency ±700¢ → ≈0.26–23Hz)
-const A4 = 440;
-const MIDI_A4 = 69;
-const TC_SMOOTH = 0.012; // 常规参数平滑(PRD 5–15ms)
-const TC_FAST = 0.005;
-/** 截止频率听感补音:补偿梯形结构的转折点偏低(调音校准,旋钮刻度 10Hz–18kHz 不变) */
-const CUTOFF_COMP = 2.5;
+const SMOOTH = 0.008; // 常规参数平滑时间常数(s)
 
-function midiToHz(m: number): number {
-  return A4 * Math.pow(2, (m - MIDI_A4) / 12);
+interface OscBank {
+  osc: OscillatorNode;
+  /** 混音器电平(On × Volume) */
+  mixer: GainNode;
+  /** 音高 FM 深度(Hz) */
+  fmDepth: GainNode;
+  lastHz: number;
 }
 
-export type FilterMode = "worklet" | "biquad";
-type EnvStage = "idle" | "attack" | "decay" | "sustain" | "release";
-
-/**
- * 包络镜像:引擎自己对自动化时间表记账,
- * 用于「从当前值重触发」(AUD-2)与重锚定(不依赖 cancelAndHoldAtTime 的浏览器兼容实现)。
- */
-class EnvMirror {
-  v0 = 0;
-  t0 = -1;
-  target = 0;
-  tc = 0.001;
-  prev: { from: number; target: number; tc: number; tStart: number } | null = null;
-
-  anchor(value: number, t: number): void {
-    this.v0 = value;
-    this.t0 = t;
-    this.prev = null;
-  }
-
-  /** 追加一段 setTargetAtTime(与 AudioParam 上的调度一一对应) */
-  schedule(target: number, tc: number, t: number): void {
-    this.prev = { from: this.v0, target: this.target, tc: this.tc, tStart: this.t0 };
-    this.v0 = this.valueAt(t);
-    this.t0 = t;
-    this.target = target;
-    this.tc = Math.max(tc, 1e-5);
-  }
-
-  valueAt(t: number): number {
-    if (t <= this.t0) {
-      const p = this.prev;
-      if (p && t > p.tStart) {
-        return p.target + (p.from - p.target) * Math.exp(-(t - p.tStart) / p.tc);
-      }
-      return this.v0;
-    }
-    return this.target + (this.v0 - this.target) * Math.exp(-(t - this.t0) / this.tc);
-  }
+export interface EngineHooks {
+  onOverload?(overloaded: boolean): void;
 }
 
 export class SynthEngine {
-  readonly ctx: BaseAudioContext;
-  readonly store: ParamStore;
-  filterMode: FilterMode = "biquad";
-  readonly mono: MonoKeyboard;
+  ctx: AudioContext | null = null;
+  private store: ParamStore;
+  private hooks: EngineHooks = {};
+  private bendSemis = 0;
 
-  /** 单音事件回调(视觉层同步琴键按下态用) */
-  onMonoEvent: ((e: MonoEvent, held: number[]) => void) | null = null;
+  /* 图节点 */
+  private oscs: OscBank[] = [];
+  private noiseWhite!: AudioBufferSourceNode;
+  private noisePink!: AudioBufferSourceNode;
+  private noiseWhiteSel!: GainNode;
+  private noisePinkSel!: GainNode;
+  private noiseBus!: GainNode;
+  private noiseMixer!: GainNode;
+  private lfo!: OscillatorNode;
+  private extStream: MediaStream | null = null;
+  private extSrc: MediaStreamAudioSourceNode | null = null;
+  private extMixer!: GainNode;
+  private extAnalyser: AnalyserNode | null = null;
+  private extPeakBuf!: Float32Array<ArrayBuffer>;
 
-  private oscs: OscillatorNode[] = [];
-  private oscMix: GainNode[] = [];
-  private noiseSrc!: AudioBufferSourceNode;
-  private noiseMix!: GainNode;
-  private extSrc: AudioBufferSourceNode | null = null;
-  private extMix!: GainNode;
-  private preMix!: GainNode;
-
-  private filter!: AudioNode;
-  private cutoffParams: AudioParam[] = [];
-  private emphasisParam: AudioParam | null = null;
+  private mixBus!: GainNode;
+  private ladder: AudioWorkletNode | null = null;
+  private ladderFallback: BiquadFilterNode[] = []; // Worklet 不可用时的 4×Biquad 降级
+  private fallbackEgGain: GainNode | null = null; // 降级链的包络→Hz 增益
   private vca!: GainNode;
   private volGain!: GainNode;
+  private shaper!: WaveShaperNode;
   private powerGain!: GainNode;
-  private uiMuteGain!: GainNode;
-  private master!: GainNode;
+  private tunerOsc!: OscillatorNode;
+  private tunerGain!: GainNode;
 
-  private modMixA!: GainNode; // 调制源 Osc-3 支路
-  private modMixB!: GainNode; // 调制源 Noise 支路
-  private modDepth!: GainNode; // 深度 = Mod 轮 × Mod 总开关
-  private pitchFm!: GainNode; // → 各 VCO detune(音分)
-  private filtFm!: GainNode; // → cutoff(Hz)
-  private bendGain!: GainNode; // 弯音(音分)→ 各 VCO detune
+  /* 调制矩阵 */
+  private modBusA!: GainNode; // 源 A 贡献 (1-mix)
+  private modBusB!: GainNode; // 源 B 贡献 (mix)
+  private modSum!: GainNode;
+  private osc3Tap!: GainNode; // osc3 → 源A
+  private filterEgSource!: ConstantSourceNode; // 滤波包络的调制源形态(0..1)
+  private lfoTap!: GainNode;
+  private noiseTap!: GainNode;
+  private filterFMOct: GainNode | null = null; // modSum → worklet fm(八度)
 
-  private loudEnv = new EnvMirror();
-  private filtEnv = new EnvMirror();
-  private loudStage: EnvStage = "idle";
-  private filtStage: EnvStage = "idle";
+  /* 键盘逻辑 */
+  keyboard!: MonoKeyboard;
+  private lastMidi = 60;
+  private overload = false;
 
-  private baseCutoff = 1000;
-  private glideTc = 0.002;
-  private oscAppliedMidi: (number | null)[] = [null, null, null];
-  private modWheelValue = 0;
-  private uiMuted = false;
-  private disposed = false;
+  workletReady = false;
 
-  private constructor(ctx: BaseAudioContext, store: ParamStore) {
-    this.ctx = ctx;
+  constructor(store: ParamStore, hooks: EngineHooks = {}) {
     this.store = store;
-    this.mono = new MonoKeyboard((e) => this.handleMono(e));
+    this.hooks = hooks;
+    this.keyboard = new MonoKeyboard({
+      onPitch: (midi, retrigger) => this.handlePitch(midi, retrigger),
+      onRelease: () => this.releaseEnvelopes(),
+    });
   }
 
-  static async create(
-    ctx: BaseAudioContext,
-    store: ParamStore,
-    workletUrl?: string
-  ): Promise<SynthEngine> {
-    const eng = new SynthEngine(ctx, store);
-    await eng.build(workletUrl);
-    eng.bindParams();
-    eng.applyAllParams();
-    return eng;
-  }
-
-  // ------------------------------------------------------------------
-  // 音频图构建(常驻)
-  // ------------------------------------------------------------------
-  private async build(workletUrl?: string): Promise<void> {
-    const ctx = this.ctx;
-
-    for (let i = 0; i < 3; i++) {
-      const osc = ctx.createOscillator();
-      osc.setPeriodicWave(getWave(ctx, WAVE_NAMES[this.store.get(`osc${i + 1}Wave`)]));
-      osc.frequency.value = midiToHz(60);
-      const mix = ctx.createGain();
-      mix.gain.value = 0;
-      osc.connect(mix);
-      osc.start();
-      this.oscs.push(osc);
-      this.oscMix.push(mix);
+  /** 首次用户手势时创建音频上下文并建图(AUD-14);可注入离线上下文供自检 */
+  async ensureStarted(external?: BaseAudioContext): Promise<void> {
+    if (external) {
+      if (this.ctx === (external as AudioContext)) return;
+      this.ctx = external as AudioContext;
+    } else if (this.ctx) {
+      if (this.ctx.state === "suspended") await this.ctx.resume();
+      return;
     }
+    const ctx = (this.ctx ?? new AudioContext({ latencyHint: "interactive" })) as AudioContext;
+    this.ctx = ctx;
 
-    // 白噪声:mulberry32 确定性生成(频谱平坦,离线测试可复现)
-    const nb = ctx.createBuffer(1, Math.ceil(ctx.sampleRate * 2), ctx.sampleRate);
-    const nd = nb.getChannelData(0);
-    let seed = 0x9e3779b9;
-    for (let i = 0; i < nd.length; i++) {
-      seed = (seed + 0x6d2b79f5) | 0;
-      let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
-      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-      nd[i] = ((t ^ (t >>> 14)) >>> 0) / 0xffffffff * 2 - 1;
-    }
-    this.noiseSrc = ctx.createBufferSource();
-    this.noiseSrc.buffer = nb;
-    this.noiseSrc.loop = true;
-    this.noiseMix = ctx.createGain();
-    this.noiseMix.gain.value = 0;
-    this.noiseSrc.connect(this.noiseMix);
-    this.noiseSrc.start();
-
-    this.extMix = ctx.createGain();
-    this.extMix.gain.value = 0;
-
-    this.preMix = ctx.createGain();
-    this.preMix.gain.value = 0.85;
-    for (const g of this.oscMix) g.connect(this.preMix);
-    this.noiseMix.connect(this.preMix);
-    this.extMix.connect(this.preMix);
-
-    // 梯形滤波器:优先 AudioWorklet;不可用时降级 4 极(2×Biquad 巴特沃斯级联,24dB/oct)
-    let workletOk = false;
-    if (workletUrl && ctx.audioWorklet) {
-      try {
-        await ctx.audioWorklet.addModule(workletUrl);
-        const node = new AudioWorkletNode(ctx, "aether-ladder-filter", {
-          numberOfInputs: 1,
-          numberOfOutputs: 1,
-          outputChannelCount: [1],
-        });
-        this.preMix.connect(node);
-        this.filter = node;
-        this.cutoffParams = [node.parameters.get("cutoff")!];
-        this.emphasisParam = node.parameters.get("emphasis")!;
-        this.filterMode = "worklet";
-        workletOk = true;
-      } catch {
-        workletOk = false;
-      }
-    }
-    if (!workletOk) {
-      const bq1 = ctx.createBiquadFilter();
-      const bq2 = ctx.createBiquadFilter();
-      bq1.type = "lowpass";
-      bq2.type = "lowpass";
-      bq1.Q.value = 0.541; // 4 极巴特沃斯极点对 → 合成斜率 24dB/oct
-      bq2.Q.value = 1.307;
-      this.preMix.connect(bq1);
-      bq1.connect(bq2);
-      this.filter = bq2;
-      this.cutoffParams = [bq1.frequency, bq2.frequency];
-      this.filterMode = "biquad";
-    }
-
+    /* ---- 输出链 ---- */
+    this.mixBus = ctx.createGain();
     this.vca = ctx.createGain();
     this.vca.gain.value = 0;
     this.volGain = ctx.createGain();
-    const sat = ctx.createWaveShaper();
-    sat.curve = makeSatCurve();
-    sat.oversample = "2x";
+    this.shaper = ctx.createWaveShaper();
+    this.shaper.curve = softClipCurve();
+    this.shaper.oversample = "2x";
     this.powerGain = ctx.createGain();
-    this.uiMuteGain = ctx.createGain();
-    this.master = ctx.createGain();
-    this.master.gain.value = 0.9;
+    this.powerGain.gain.value = 0;
 
-    this.filter.connect(this.vca);
-    this.vca.connect(this.volGain);
-    this.volGain.connect(sat);
-    sat.connect(this.powerGain);
-    this.powerGain.connect(this.uiMuteGain);
-    this.uiMuteGain.connect(this.master);
-    this.master.connect(ctx.destination);
+    /* ---- 滤波包络的调制源形态(降级链与源 A 共用,需先建) ---- */
+    this.filterEgSource = ctx.createConstantSource();
+    this.filterEgSource.offset.value = 0;
+    this.filterEgSource.start();
 
-    // ---- 调制总线:源 = Mod Mix(Osc-3 ↔ Noise 交叉混合)----
-    this.modMixA = ctx.createGain();
-    this.modMixB = ctx.createGain();
-    this.oscs[2].connect(this.modMixA);
-    this.noiseSrc.connect(this.modMixB);
-    this.modDepth = ctx.createGain();
-    this.modDepth.gain.value = 0;
-    this.modMixA.connect(this.modDepth);
-    this.modMixB.connect(this.modDepth);
-
-    // 音高 FM:±300 音分满深 → 各 VCO detune
-    this.pitchFm = ctx.createGain();
-    this.pitchFm.gain.value = 300;
-    this.modDepth.connect(this.pitchFm);
-    for (const osc of this.oscs) this.pitchFm.connect(osc.detune);
-
-    // 滤波 FM:满深 ≈ ±1 octave → cutoff param(a-rate,音频率调制)
-    this.filtFm = ctx.createGain();
-    this.filtFm.gain.value = 0;
-    this.modDepth.connect(this.filtFm);
-    for (const p of this.cutoffParams) this.filtFm.connect(p);
-
-    // 弯音:恒源 → 增益(音分)→ 各 VCO detune
-    const bendSrc = ctx.createConstantSource();
-    bendSrc.offset.value = 1;
-    this.bendGain = ctx.createGain();
-    this.bendGain.gain.value = 0;
-    bendSrc.connect(this.bendGain);
-    for (const osc of this.oscs) this.bendGain.connect(osc.detune);
-    bendSrc.start();
-  }
-
-  // ------------------------------------------------------------------
-  // ParamStore → AudioParam 绑定
-  // ------------------------------------------------------------------
-  private bindParams(): void {
-    const s = this.store;
-    for (let i = 1; i <= 3; i++) {
-      s.subscribe(`osc${i}Vol`, (_id, v) =>
-        this.smooth(this.oscMix[i - 1].gain, Math.pow(v / 10, 1.5))
-      );
-      s.subscribe(`osc${i}Wave`, (_id, v) => {
-        this.oscs[i - 1].setPeriodicWave(getWave(this.ctx, WAVE_NAMES[v]));
-      });
-      s.subscribe(`osc${i}Freq`, () => this.refreshDetune(i - 1));
-      s.subscribe(`osc${i}Range`, () => {
-        if (i === 3) this.updateOsc3Wiring();
-        this.retuneOsc(i - 1);
-      });
-    }
-    s.subscribe("osc3Control", () => this.retuneOsc(2));
-    s.subscribe("tune", () => {
-      this.refreshDetune(0);
-      this.refreshDetune(1);
-      this.refreshDetune(2);
-    });
-    s.subscribe("glide", (_id, v) => {
-      const t = glideSeconds(v);
-      this.glideTc = t > 0 ? t : 0.002;
-    });
-    s.subscribe("modMix", (_id, v) => {
-      const k = v / 10;
-      this.smooth(this.modMixA.gain, 1 - k);
-      this.smooth(this.modMixB.gain, k);
-    });
-    s.subscribe("modSwitch", () => this.applyModDepth());
-    s.subscribe("filtModSwitch", () => this.applyFiltFmDepth());
-    s.subscribe("cutoff", () => this.refreshCutoffBase());
-    s.subscribe("emphasis", (_id, v) => {
-      if (this.emphasisParam) this.smooth(this.emphasisParam, v);
-    });
-    s.subscribe("kc1", () => this.refreshCutoffBase());
-    s.subscribe("kc2", () => this.refreshCutoffBase());
-    s.subscribe("volume", (_id, v) =>
-      this.smooth(this.volGain.gain, Math.pow(v / 10, 1.8))
-    );
-    s.subscribe("power", (_id, v) =>
-      this.smooth(this.powerGain.gain, v >= 0.5 ? 1 : 0, 0.03)
-    );
-    s.subscribe("noiseVol", (_id, v) =>
-      this.smooth(this.noiseMix.gain, Math.pow(v / 10, 1.5))
-    );
-    s.subscribe("extVol", (_id, v) =>
-      this.smooth(this.extMix.gain, Math.pow(v / 10, 1.5))
-    );
-  }
-
-  private applyAllParams(): void {
-    const s = this.store;
-    for (let i = 1; i <= 3; i++) {
-      this.oscMix[i - 1].gain.value = Math.pow(s.get(`osc${i}Vol`) / 10, 1.5);
-      this.oscs[i - 1].setPeriodicWave(
-        getWave(this.ctx, WAVE_NAMES[s.get(`osc${i}Wave`)])
-      );
-      this.refreshDetune(i - 1);
-    }
-    this.glideTc = glideSeconds(s.get("glide")) || 0.002;
-    this.modMixA.gain.value = 1 - s.get("modMix") / 10;
-    this.modMixB.gain.value = s.get("modMix") / 10;
-    if (this.emphasisParam) this.emphasisParam.value = s.get("emphasis");
-    this.volGain.gain.value = Math.pow(s.get("volume") / 10, 1.8);
-    this.noiseMix.gain.value = Math.pow(s.get("noiseVol") / 10, 1.5);
-    this.extMix.gain.value = Math.pow(s.get("extVol") / 10, 1.5);
-    this.powerGain.gain.value = s.isOn("power") ? 1 : 0;
-    this.updateOsc3Wiring();
-    this.refreshCutoffBase();
-    this.applyModDepth();
-  }
-
-  private refreshDetune(i: number): void {
-    const cents = this.store.get("tune") + this.store.get(`osc${i + 1}Freq`);
-    this.oscs[i].detune.setTargetAtTime(cents, this.ctx.currentTime, TC_SMOOTH);
-  }
-
-  /** Osc-3 LO 模式下断开弯音/音高 FM 注入(§8.5:LO 自身不接收 FM,避免自调制) */
-  private updateOsc3Wiring(): void {
-    const lo = this.store.get("osc3Range") === 0;
-    const detune = this.oscs[2].detune;
+    /* ---- 梯形滤波器:优先 Worklet,降级 4×Biquad(AUD-6) ---- */
+    let filterReady = false;
     try {
-      this.pitchFm.disconnect(detune);
-      this.bendGain.disconnect(detune);
+      await ctx.audioWorklet.addModule("audio/ladder-processor.js");
+      this.ladder = new AudioWorkletNode(ctx, "ladder-processor", {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        outputChannelCount: [1],
+      });
+      this.mixBus.connect(this.ladder);
+      this.ladder.connect(this.vca);
+      filterReady = true;
+      this.workletReady = true;
     } catch {
-      /* 原本未连接 */
+      /* 降级:4 × 低通 Biquad 级联(兼容模式) */
     }
-    if (!lo) {
-      this.pitchFm.connect(detune);
-      this.bendGain.connect(detune);
-    }
-  }
-
-  /** 某振荡器当前目标频率(Hz) */
-  private oscFreq(i: number): number {
-    const s = this.store;
-    const n = i + 1;
-    const rangeIdx = s.get(`osc${n}Range`);
-    if (n === 3 && rangeIdx === 0) {
-      return LO_BASE_HZ * Math.pow(2, s.get("osc3Freq") / 1200);
-    }
-    const mult = RANGE_MULT[n === 3 ? rangeIdx - 1 : rangeIdx] ?? 1;
-    const midi =
-      n === 3 && !s.isOn("osc3Control")
-        ? this.oscAppliedMidi[i] ?? 60 // Control OFF:脱离键盘,停在最后音高
-        : this.mono.current ?? this.oscAppliedMidi[i] ?? 60;
-    return midiToHz(midi) * mult;
-  }
-
-  private retuneOsc(i: number): void {
-    this.oscAppliedMidi[i] = this.mono.current;
-    this.oscs[i].frequency.setTargetAtTime(
-      this.oscFreq(i),
-      this.ctx.currentTime,
-      this.glideTc
-    );
-  }
-
-  private retuneAll(): void {
-    for (let i = 0; i < 3; i++) this.retuneOsc(i);
-  }
-
-  /** 键盘跟踪后的基准截止(KC1=+100%/oct,KC2=+50%/oct,AUD-7) */
-  private computeBaseCutoff(): number {
-    const s = this.store;
-    const kt = (s.isOn("kc1") ? 1 : 0) + (s.isOn("kc2") ? 0.5 : 0);
-    const midi = this.mono.current ?? 60;
-    const mult = Math.pow(2, (kt * (midi - 60)) / 12);
-    return Math.min(18000, Math.max(10, s.get("cutoff") * CUTOFF_COMP * mult));
-  }
-
-  private refreshCutoffBase(): void {
-    this.baseCutoff = this.computeBaseCutoff();
-    this.applyFiltFmDepth();
-    const t = this.ctx.currentTime;
-    if (this.filtStage === "idle") {
-      for (const p of this.cutoffParams) {
-        p.setTargetAtTime(this.baseCutoff, t, TC_SMOOTH);
+    if (!filterReady) {
+      this.ladderFallback = [];
+      let prev: BiquadFilterNode | null = null;
+      for (let i = 0; i < 4; i++) {
+        const f = ctx.createBiquadFilter();
+        f.type = "lowpass";
+        f.Q.value = 0.707;
+        if (prev) prev.connect(f);
+        this.ladderFallback.push(f);
+        prev = f;
       }
-      this.filtEnv.anchor(this.filtEnv.valueAt(t), t);
-      this.filtEnv.schedule(this.baseCutoff, TC_SMOOTH, t);
-    } else if (this.filtStage === "sustain") {
-      this.scheduleFiltSustain(t);
+      this.mixBus.connect(this.ladderFallback[0]);
+      this.ladderFallback[3].connect(this.vca);
+      // 滤波包络 → 截止 Hz(近似)
+      this.fallbackEgGain = ctx.createGain();
+      this.filterEgSource.connect(this.fallbackEgGain);
+      this.fallbackEgGain.connect(this.ladderFallback[0].frequency);
     }
-  }
 
-  private applyFiltFmDepth(): void {
-    this.smooth(this.filtFm.gain, this.store.isOn("filtModSwitch") ? this.baseCutoff : 0);
-  }
+    this.vca.connect(this.volGain);
+    this.volGain.connect(this.shaper);
+    this.shaper.connect(this.powerGain);
+    this.powerGain.connect(ctx.destination);
 
-  private applyModDepth(): void {
-    this.smooth(this.modDepth.gain, this.store.isOn("modSwitch") ? this.modWheelValue : 0);
-  }
-
-  // ------------------------------------------------------------------
-  // 单音事件 → 包络/音高调度
-  // ------------------------------------------------------------------
-  private handleMono(e: MonoEvent): void {
-    const t = this.ctx.currentTime;
-    switch (e.type) {
-      case "press":
-        this.retuneAll();
-        this.loudPress(t);
-        this.filtPress(t);
-        break;
-      case "glideTo":
-        this.retuneAll(); // 回退音:只滑音高,不重触发(AUD-1/2)
-        this.refreshCutoffBase();
-        break;
-      case "release":
-      case "panic":
-        this.loudRelease(t);
-        this.filtRelease(t);
-        break;
+    /* ---- 三 VCO ---- */
+    for (let n = 0; n < 3; n++) {
+      const osc = ctx.createOscillator();
+      osc.setPeriodicWave(periodicWave(ctx, this.oscWave(n + 1)));
+      osc.frequency.value = 110 * (n + 1);
+      const mixer = ctx.createGain();
+      mixer.gain.value = 0;
+      const fmDepth = ctx.createGain();
+      fmDepth.gain.value = 0;
+      osc.connect(mixer);
+      mixer.connect(this.mixBus);
+      osc.start();
+      this.oscs.push({ osc, mixer, fmDepth, lastHz: osc.frequency.value });
     }
-    this.onMonoEvent?.(e, this.mono.heldNotes());
-  }
 
-  // ---- 响度包络(AUD-8):A →(Sustain ON ? 保持 0.75 : 衰减到 0),R → 0 ----
-  private loudPress(t: number): void {
-    const s = this.store;
-    const A = s.get("loudA");
-    const D = s.get("loudD");
-    const decayOnly = s.isOn("decaySwitch") || !s.isOn("loudSustain");
-    const g = this.vca.gain;
-    const cur = this.loudEnv.valueAt(t);
-    g.cancelScheduledValues(t);
-    g.setValueAtTime(cur, t);
-    this.loudEnv.anchor(cur, t);
-    g.setTargetAtTime(1, t, A / 3);
-    this.loudEnv.schedule(1, A / 3, t);
-    const sus = decayOnly ? 0 : 0.75;
-    g.setTargetAtTime(sus, t + A, D / 3);
-    this.loudEnv.schedule(sus, D / 3, t + A);
-    this.loudStage = decayOnly ? "decay" : "sustain";
-  }
+    /* ---- 噪声(白 + 粉,双源选择) ---- */
+    this.noiseWhite = ctx.createBufferSource();
+    this.noiseWhite.buffer = makeNoise(ctx, "white");
+    this.noiseWhite.loop = true;
+    this.noisePink = ctx.createBufferSource();
+    this.noisePink.buffer = makeNoise(ctx, "pink");
+    this.noisePink.loop = true;
+    this.noiseWhiteSel = ctx.createGain();
+    this.noisePinkSel = ctx.createGain();
+    this.noiseBus = ctx.createGain();
+    this.noiseMixer = ctx.createGain();
+    this.noiseMixer.gain.value = 0;
+    this.noiseWhite.connect(this.noiseWhiteSel);
+    this.noisePink.connect(this.noisePinkSel);
+    this.noiseWhiteSel.connect(this.noiseBus);
+    this.noisePinkSel.connect(this.noiseBus);
+    this.noiseBus.connect(this.noiseMixer);
+    this.noiseMixer.connect(this.mixBus);
+    this.noiseWhite.start();
+    this.noisePink.start();
 
-  private loudRelease(t: number): void {
-    if (this.loudStage === "idle") return;
-    const R = this.store.get("loudR");
-    const g = this.vca.gain;
-    const cur = this.loudEnv.valueAt(t);
-    g.cancelScheduledValues(t);
-    g.setValueAtTime(cur, t);
-    this.loudEnv.anchor(cur, t);
-    g.setTargetAtTime(0, t, R / 3);
-    this.loudEnv.schedule(0, R / 3, t);
-    this.loudStage = "release";
-  }
+    /* ---- 独立 LFO ---- */
+    this.lfo = ctx.createOscillator();
+    this.applyLfoShape();
+    this.lfo.frequency.value = lfoHz(this.store.num("lfoRate"));
+    this.lfo.start();
 
-  // ---- 滤波包络:cutoff = base × 2^(0.4·Contour·e),e∈[0,1] ----
-  private filtPeakHz(): number {
-    return this.baseCutoff * Math.pow(2, 0.4 * this.store.get("contour"));
-  }
+    /* ---- 外部输入 ---- */
+    this.extMixer = ctx.createGain();
+    this.extMixer.gain.value = 0;
+    this.extMixer.connect(this.mixBus);
+    this.extPeakBuf = new Float32Array(1024);
 
-  private filtSusHz(decayOnly: boolean): number {
-    return decayOnly ? this.baseCutoff : this.baseCutoff * Math.pow(2, 0.4 * this.store.get("contour") * 0.8);
-  }
+    /* ---- 调制矩阵 ---- */
+    this.modBusA = ctx.createGain();
+    this.modBusB = ctx.createGain();
+    this.modSum = ctx.createGain();
+    this.osc3Tap = ctx.createGain();
+    this.osc3Tap.gain.value = 0.6;
+    this.lfoTap = ctx.createGain();
+    this.lfoTap.gain.value = 1;
+    this.noiseTap = ctx.createGain();
+    this.noiseTap.gain.value = 0.5;
+    this.modBusA.connect(this.modSum);
+    this.modBusB.connect(this.modSum);
+    this.oscs[2].osc.connect(this.osc3Tap);
+    this.lfo.connect(this.lfoTap);
+    this.noiseBus.connect(this.noiseTap);
 
-  private filtPress(t: number): void {
-    const s = this.store;
-    const A = s.get("filtA");
-    const D = s.get("filtD");
-    this.baseCutoff = this.computeBaseCutoff();
-    const peak = this.filtPeakHz();
-    const decayOnly = s.isOn("decaySwitch") || !s.isOn("filtSustain");
-    const sus = this.filtSusHz(decayOnly);
-    const cur = this.filtEnv.valueAt(t);
-    for (const p of this.cutoffParams) {
-      p.cancelScheduledValues(t);
-      p.setValueAtTime(cur, t);
-      p.setTargetAtTime(peak, t, A / 3);
-      p.setTargetAtTime(sus, t + A, D / 3);
+    if (this.ladder) {
+      this.filterFMOct = ctx.createGain();
+      this.filterFMOct.gain.value = 0;
+      this.modSum.connect(this.filterFMOct);
+      this.filterFMOct.connect(this.ladder.parameters.get("fm")!);
     }
-    this.filtEnv.anchor(cur, t);
-    this.filtEnv.schedule(peak, A / 3, t);
-    this.filtEnv.schedule(sus, D / 3, t + A);
-    this.filtStage = decayOnly ? "decay" : "sustain";
-  }
-
-  private scheduleFiltSustain(t: number): void {
-    const s = this.store;
-    const decayOnly = s.isOn("decaySwitch") || !s.isOn("filtSustain");
-    const sus = this.filtSusHz(decayOnly);
-    for (const p of this.cutoffParams) p.setTargetAtTime(sus, t, s.get("filtD") / 3);
-    this.filtEnv.schedule(sus, s.get("filtD") / 3, t);
-  }
-
-  private filtRelease(t: number): void {
-    if (this.filtStage === "idle") return;
-    const R = this.store.get("filtR");
-    const cur = this.filtEnv.valueAt(t);
-    for (const p of this.cutoffParams) {
-      p.cancelScheduledValues(t);
-      p.setValueAtTime(cur, t);
-      p.setTargetAtTime(this.baseCutoff, t, R / 3);
+    // 音高 FM:modSum → 每振荡器独立深度 → osc.frequency(AudioParam 叠加)
+    for (const bank of this.oscs) {
+      this.modSum.connect(bank.fmDepth);
+      bank.fmDepth.connect(bank.osc.frequency);
     }
-    this.filtEnv.anchor(cur, t);
-    this.filtEnv.schedule(this.baseCutoff, R / 3, t);
-    this.filtStage = "release";
+
+    /* ---- A-440 调音器(独立支路,仅受电源总闸) ---- */
+    this.tunerOsc = ctx.createOscillator();
+    this.tunerOsc.frequency.value = 440;
+    this.tunerGain = ctx.createGain();
+    this.tunerGain.gain.value = 0;
+    this.tunerOsc.connect(this.tunerGain);
+    this.tunerGain.connect(this.powerGain);
+    this.tunerOsc.start();
+
+    this.rewireModSources(false);
+    this.syncAll();
   }
 
-  // ------------------------------------------------------------------
-  // 演奏对外接口
-  // ------------------------------------------------------------------
+  /* ===================== 键盘 → 事件 ===================== */
+
   noteOn(midi: number): void {
-    if (midi < 21 || midi > 108) return;
-    this.mono.press(midi);
+    if (!this.ctx) return;
+    this.keyboard.noteOn(midi);
   }
-
   noteOff(midi: number): void {
-    this.mono.release(midi);
+    if (!this.ctx) return;
+    this.keyboard.noteOff(midi);
+  }
+  allNotesOff(): void {
+    this.keyboard.allOff();
   }
 
-  /** 空格 panic / 窗口失焦:All Notes Off(INT-9/INT-11) */
-  panic(): void {
-    this.mono.allOff();
+  private handlePitch(midi: number, retrigger: boolean): void {
+    const ctx = this.ctx;
+    if (!ctx) return;
+    this.lastMidi = midi;
+    this.updateOscFrequencies(midi, /*glide*/ true);
+    if (retrigger) this.triggerEnvelopes(ctx.currentTime);
   }
 
-  setPitchBend(cents: number): void {
-    const c = Math.min(240, Math.max(-240, cents));
-    this.bendGain.gain.setTargetAtTime(c, this.ctx.currentTime, TC_FAST);
-  }
-
-  setModWheel(v: number): void {
-    this.modWheelValue = Math.min(1, Math.max(0, v));
-    this.applyModDepth();
-  }
-
-  /** 覆盖层静音键(独立于面板 Volume,PRD UI-1) */
-  setUiMuted(muted: boolean): void {
-    this.uiMuted = muted;
-    this.smooth(this.uiMuteGain.gain, muted ? 0 : 1, 0.03);
-  }
-
-  get isUiMuted(): boolean {
-    return this.uiMuted;
-  }
-
-  /** 外部输入(PRD AUD-15):本地音频文件循环 → Ext 电平 */
-  loadExtBuffer(buffer: AudioBuffer): void {
-    if (this.extSrc) {
-      try {
-        this.extSrc.stop();
-      } catch {
-        /* ignore */
-      }
-      this.extSrc.disconnect();
+  private releaseEnvelopes(): void {
+    const ctx = this.ctx;
+    if (!ctx) return;
+    const now = ctx.currentTime;
+    const g = this.vca.gain;
+    g.cancelScheduledValues(now);
+    g.setValueAtTime(Math.max(0, g.value), now);
+    g.setTargetAtTime(0, now, RELEASE_SECONDS / 3);
+    if (!this.ladder) {
+      const off = this.filterEgSource.offset;
+      off.cancelScheduledValues(now);
+      off.setValueAtTime(Math.max(0, off.value), now);
+      off.setTargetAtTime(0, now, RELEASE_SECONDS / 3);
     }
-    const src = this.ctx.createBufferSource();
-    src.buffer = buffer;
-    src.loop = true;
-    src.connect(this.extMix);
-    src.start();
-    this.extSrc = src;
   }
 
-  private smooth(p: AudioParam, v: number, tc = TC_SMOOTH): void {
-    p.setTargetAtTime(v, this.ctx.currentTime, tc);
+  private triggerEnvelopes(now: number): void {
+    const s = this.store;
+    /* 响度包络(A/D/S;Decay 开关时 Sustain=0) */
+    const aA = envSeconds(s.num("loudA"));
+    const aD = envSeconds(s.num("loudD"));
+    const aS = s.bool("decayMode") ? 0 : s.num("loudS") / 10;
+    const g = this.vca.gain;
+    const cur = Math.max(0, Math.min(1, g.value));
+    g.cancelScheduledValues(now);
+    g.setValueAtTime(cur, now);
+    if (aA <= 0.002) {
+      g.setValueAtTime(1, now);
+    } else {
+      g.linearRampToValueAtTime(1, now + aA);
+    }
+    g.setTargetAtTime(aS, now + aA, Math.max(aD / 4, 0.005));
+
+    /* 滤波包络:Worklet 内部精确实现;主线程近似仅用于
+       (a) 降级链的截止自动化 (b) Filter EG 作为调制源 A */
+    const fA = envSeconds(s.num("filtA"));
+    const fD = envSeconds(s.num("filtD"));
+    const fS = s.bool("decayMode") ? 0 : s.num("filtS") / 10;
+    if (this.ladder) {
+      this.ladder.port.postMessage({ type: "noteOn" });
+    }
+    if (!this.ladder || s.bool("srcAFilterEg")) {
+      const off = this.filterEgSource.offset;
+      off.cancelScheduledValues(now);
+      off.setValueAtTime(Math.max(0, Math.min(1, off.value)), now);
+      if (fA <= 0.002) {
+        off.setValueAtTime(1, now);
+      } else {
+        off.linearRampToValueAtTime(1, now + fA);
+      }
+      off.setTargetAtTime(fS, now + fA, Math.max(fD / 4, 0.005));
+    }
+  }
+
+  /* ===================== 音高 ===================== */
+
+  private oscWave(n: number): WaveName {
+    return this.store.str(`osc${n}Wave`) as WaveName;
+  }
+
+  /** 更新三个振荡器频率(含滑音、LO 档、Osc-3 自由模式、弯音) */
+  updateOscFrequencies(midi: number, glide: boolean): void {
+    const ctx = this.ctx;
+    if (!ctx) return;
+    const s = this.store;
+    const now = ctx.currentTime;
+    const master = s.num("tune");
+    const glideOn = s.bool("glideOn") && s.num("glideTime") > 0.01;
+    const tau = glide && glideOn ? glideSeconds(s.num("glideTime")) / 3 : 0.004;
+
+    for (let i = 0; i < 3; i++) {
+      const n = i + 1;
+      const range = s.str(`osc${n}Range`);
+      let hz: number;
+      if (range === "LO") {
+        // LO 档:Frequency 旋钮 −12..+12 → 0.2–20Hz 对数(AUD-3)
+        hz = loHz(((s.num(`osc${n}Tune`) + 12) / 24) * 10);
+      } else if (n === 3 && !s.bool("osc3Control")) {
+        // Osc-3 Control OFF:脱离键盘与弯音,以中央 C 为基准自由运行(AUD-10)
+        hz = oscHzClamped(60, RANGE_OCT[range], s.num("osc3Tune"), master, 0);
+      } else {
+        hz = oscHzClamped(midi, RANGE_OCT[range], s.num(`osc${n}Tune`), master, this.bendSemis);
+      }
+      this.oscs[i].lastHz = hz;
+      this.oscs[i].osc.frequency.cancelScheduledValues(now);
+      this.oscs[i].osc.frequency.setTargetAtTime(hz, now, tau);
+    }
+    this.updatePitchFMDepths();
+  }
+
+  /** 弯音轮(±2 半音,AUD-12):所有受键盘控制的 VCO 即时重算 */
+  setBend(semis: number): void {
+    this.bendSemis = clamp(semis, -2, 2);
+    this.updateOscFrequencies(this.lastMidi, false);
+  }
+
+  private updatePitchFMDepths(): void {
+    const ctx = this.ctx;
+    if (!ctx) return;
+    const s = this.store;
+    const wheel = s.num("modWheel") / 100;
+    const oscModOn = s.bool("oscMod");
+    const mixN = s.num("modMix") / 10;
+    const srcAIsOsc3 = !s.bool("srcAFilterEg");
+    // 相对频率偏差(满深度 = PITCH_FM_SEMITONES 半音)
+    const devRatio = Math.pow(2, (PITCH_FM_SEMITONES * wheel) / 12) - 1;
+    for (let i = 0; i < 3; i++) {
+      const n = i + 1;
+      const range = s.str(`osc${n}Range`);
+      // LO 档不接收音高 FM,避免自调制(AUD-10)
+      const skip = !oscModOn || range === "LO";
+      // 源 A = Osc.3 时,Osc-3 只接收源 B 份额(不自调制)
+      const share = n === 3 && srcAIsOsc3 ? mixN : 1;
+      const depth = skip ? 0 : this.oscs[i].lastHz * devRatio * share;
+      this.oscs[i].fmDepth.gain.setTargetAtTime(depth, ctx.currentTime, SMOOTH);
+    }
+  }
+
+  /* ===================== 参数同步(ParamStore → Audio) ===================== */
+
+  syncAll(): void {
+    const ids = [
+      "osc1Wave", "osc2Wave", "osc3Wave",
+      "osc1Vol", "osc2Vol", "osc3Vol",
+      "osc1On", "osc2On", "osc3On",
+      "noiseOn", "noiseVol", "noiseType",
+      "extOn", "extVol",
+      "lfoRate", "lfoWave",
+      "cutoff", "emphasis", "contour",
+      "filtA", "filtD", "filtS", "decayMode",
+      "volume", "power", "tunerOn",
+      "modMix", "srcAFilterEg", "srcBLfo", "oscMod", "filterMod",
+      "kc1", "kc2", "modWheel",
+      "tune", "glideOn", "glideTime",
+      "osc1Range", "osc2Range", "osc3Range",
+      "osc1Tune", "osc2Tune", "osc3Tune", "osc3Control",
+    ];
+    for (const id of ids) this.syncParam(id);
+    this.updateOscFrequencies(this.lastMidi, false);
+  }
+
+  syncParam(id: string): void {
+    const ctx = this.ctx;
+    if (!ctx) return;
+    const s = this.store;
+    const now = ctx.currentTime;
+    switch (id) {
+      case "osc1Wave":
+      case "osc2Wave":
+      case "osc3Wave": {
+        const n = Number(id[3]);
+        this.oscs[n - 1].osc.setPeriodicWave(periodicWave(ctx, this.oscWave(n)));
+        break;
+      }
+      case "osc1Vol":
+      case "osc2Vol":
+      case "osc3Vol":
+      case "osc1On":
+      case "osc2On":
+      case "osc3On": {
+        const n = Number(id[3]);
+        const on = s.bool(`osc${n}On`);
+        this.oscs[n - 1].mixer.gain.setTargetAtTime(
+          on ? mixerGain(s.num(`osc${n}Vol`)) : 0,
+          now,
+          SMOOTH,
+        );
+        break;
+      }
+      case "noiseOn":
+      case "noiseVol":
+        this.noiseMixer.gain.setTargetAtTime(
+          s.bool("noiseOn") ? mixerGain(s.num("noiseVol")) : 0,
+          now,
+          SMOOTH,
+        );
+        break;
+      case "noiseType": {
+        const pink = s.bool("noiseType");
+        this.noiseWhiteSel.gain.setTargetAtTime(pink ? 0 : 1, now, 0.02);
+        this.noisePinkSel.gain.setTargetAtTime(pink ? 1 : 0, now, 0.02);
+        break;
+      }
+      case "extOn":
+      case "extVol":
+        this.extMixer.gain.setTargetAtTime(
+          s.bool("extOn") ? mixerGain(s.num("extVol")) * 1.6 : 0,
+          now,
+          SMOOTH,
+        );
+        break;
+      case "lfoRate":
+        this.lfo.frequency.setTargetAtTime(lfoHz(s.num("lfoRate")), now, 0.05);
+        break;
+      case "lfoWave":
+        this.applyLfoShape();
+        break;
+      case "cutoff":
+      case "kc1":
+      case "kc2":
+      case "emphasis":
+      case "contour":
+      case "filtA":
+      case "filtD":
+      case "filtS":
+      case "decayMode":
+        this.pushFilterParams();
+        break;
+      case "volume":
+        this.volGain.gain.setTargetAtTime(masterGain(s.num("volume")), now, SMOOTH);
+        break;
+      case "power":
+        this.setPower(s.bool("power"));
+        break;
+      case "tunerOn":
+        this.tunerGain.gain.setTargetAtTime(s.bool("tunerOn") ? 0.12 : 0, now, 0.03);
+        break;
+      case "modMix":
+      case "srcAFilterEg":
+      case "srcBLfo":
+        this.updateModMix();
+        break;
+      case "oscMod":
+      case "modWheel":
+        this.updatePitchFMDepths();
+        this.updateFilterFM();
+        break;
+      case "filterMod":
+        this.updateFilterFM();
+        break;
+      case "osc1Range":
+      case "osc2Range":
+      case "osc3Range":
+      case "osc1Tune":
+      case "osc2Tune":
+      case "osc3Tune":
+      case "osc3Control":
+      case "tune":
+      case "glideOn":
+      case "glideTime":
+        this.updateOscFrequencies(this.lastMidi, false);
+        break;
+      default:
+        break;
+    }
+  }
+
+  private applyLfoShape(): void {
+    this.lfo.type = this.store.bool("lfoWave") ? "square" : "triangle";
+  }
+
+  /* ---- 滤波器参数 ---- */
+  private pushFilterParams(): void {
+    const s = this.store;
+    const base = this.baseCutoffHz();
+    const res = resonance(s.num("emphasis"));
+    const cOct = contourOctaves(s.num("contour"));
+    if (this.ladder) {
+      this.ladder.port.postMessage({
+        type: "params",
+        cutoff: base,
+        resonance: res,
+        contourOct: cOct,
+        attackS: envSeconds(s.num("filtA")),
+        decayS: envSeconds(s.num("filtD")),
+        sustain: s.bool("decayMode") ? 0 : s.num("filtS") / 10,
+        decayMode: s.bool("decayMode"),
+      });
+    } else if (this.ladderFallback.length) {
+      const now = this.ctx!.currentTime;
+      for (const f of this.ladderFallback) {
+        f.frequency.setTargetAtTime(base, now, 0.012);
+      }
+      // 共振近似:首级承载 Q
+      this.ladderFallback[0].Q.setTargetAtTime(0.707 + res * res * 10, now, 0.012);
+      if (this.fallbackEgGain) {
+        // 包络 0→1 时截止从 base 扫到 base·2^cOct
+        this.fallbackEgGain.gain.setTargetAtTime(
+          base * (Math.pow(2, cOct) - 1),
+          now,
+          0.012,
+        );
+      }
+    }
+  }
+
+  /** 键盘跟踪后的基础截止(AUD-7:KC1 +100%,KC2 +50%) */
+  private baseCutoffHz(): number {
+    const s = this.store;
+    let hz = cutoffHz(s.num("cutoff"));
+    const kc = kcOctaves(s.bool("kc1"), s.bool("kc2"));
+    if (kc > 0) hz *= Math.pow(2, (kc * (this.lastMidi - 60)) / 12);
+    return clamp(hz, 10, 32000);
+  }
+
+  private updateFilterFM(): void {
+    if (!this.filterFMOct || !this.ctx) return;
+    const s = this.store;
+    const wheel = s.num("modWheel") / 100;
+    const oct = s.bool("filterMod") ? FILTER_FM_OCTAVES * wheel : 0;
+    this.filterFMOct.gain.setTargetAtTime(oct, this.ctx.currentTime, SMOOTH);
+  }
+
+  /* ---- 调制矩阵接线 ---- */
+  private rewireModSources(disconnectFirst: boolean): void {
+    if (disconnectFirst) {
+      safeDisconnect(this.osc3Tap, this.modBusA);
+      safeDisconnect(this.filterEgSource, this.modBusA);
+      safeDisconnect(this.noiseTap, this.modBusB);
+      safeDisconnect(this.lfoTap, this.modBusB);
+    }
+    if (this.store.bool("srcAFilterEg")) {
+      this.filterEgSource.connect(this.modBusA);
+    } else {
+      this.osc3Tap.connect(this.modBusA);
+    }
+    if (this.store.bool("srcBLfo")) {
+      this.lfoTap.connect(this.modBusB);
+    } else {
+      this.noiseTap.connect(this.modBusB);
+    }
+  }
+
+  private updateModMix(): void {
+    if (!this.ctx) return;
+    const mix = this.store.num("modMix") / 10;
+    this.modBusA.gain.setTargetAtTime(1 - mix, this.ctx.currentTime, SMOOTH);
+    this.modBusB.gain.setTargetAtTime(mix, this.ctx.currentTime, SMOOTH);
+    this.rewireModSources(true);
+    this.updatePitchFMDepths();
+  }
+
+  /* ---- 电源(INT-8 / AUD-13) ---- */
+  setPower(on: boolean): void {
+    if (!this.ctx) return;
+    this.powerGain.gain.setTargetAtTime(on ? 1 : 0, this.ctx.currentTime, 0.03);
+    if (!on) this.allNotesOff();
+  }
+
+  /* ---- 麦克风(EXT-1) ---- */
+  async enableMic(): Promise<void> {
+    if (this.extStream) return;
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+      },
+    });
+    if (!this.ctx) await this.ensureStarted();
+    const ctx = this.ctx!;
+    this.extStream = stream;
+    this.extSrc = ctx.createMediaStreamSource(stream);
+    this.extAnalyser = ctx.createAnalyser();
+    this.extAnalyser.fftSize = 1024;
+    this.extSrc.connect(this.extAnalyser);
+    this.extSrc.connect(this.extMixer);
+    this.syncParam("extOn");
+  }
+
+  /** 轮询外部输入峰值 → Overload 灯(EXT-2);由渲染循环调用 */
+  pollOverload(): void {
+    if (!this.extAnalyser || !this.hooks.onOverload) return;
+    this.extAnalyser.getFloatTimeDomainData(this.extPeakBuf);
+    let peak = 0;
+    for (let i = 0; i < this.extPeakBuf.length; i += 4) {
+      const v = Math.abs(this.extPeakBuf[i]);
+      if (v > peak) peak = v;
+    }
+    const over = peak > 0.62 && this.store.bool("extOn");
+    if (over !== this.overload) {
+      this.overload = over;
+      this.hooks.onOverload!(over);
+    }
   }
 
   dispose(): void {
-    if (this.disposed) return;
-    this.disposed = true;
-    try {
-      for (const o of this.oscs) o.stop();
-      this.noiseSrc.stop();
-      this.extSrc?.stop();
-    } catch {
-      /* ignore */
+    this.allNotesOff();
+    this.extStream?.getTracks().forEach((t) => t.stop());
+    if (this.ctx && typeof this.ctx.close === "function") {
+      void this.ctx.close();
     }
+    this.ctx = null;
   }
 }
 
-/** 轻微软饱和(增添模拟味,AUD-12) */
-function makeSatCurve() {
-  const n = 2048;
-  const curve = new Float32Array(n);
-  const k = 1.6;
-  const norm = Math.tanh(k);
+/* ===================== 工具 ===================== */
+
+function oscHzClamped(
+  midi: number,
+  rangeOct: number,
+  tuneSemis: number,
+  masterTuneSemis: number,
+  bendSemis: number,
+): number {
+  const hz =
+    440 *
+    Math.pow(
+      2,
+      (midi - 69 + rangeOct * 12 + tuneSemis + masterTuneSemis + bendSemis) / 12,
+    );
+  return clamp(hz, 20, 20000);
+}
+
+function safeDisconnect(src: AudioNode, dst: AudioNode): void {
+  try {
+    src.disconnect(dst);
+  } catch {
+    /* 未连接 */
+  }
+}
+
+function softClipCurve(): Float32Array<ArrayBuffer> {
+  const n = 1024;
+  const curve = new Float32Array(new ArrayBuffer(n * 4));
   for (let i = 0; i < n; i++) {
     const x = (i / (n - 1)) * 2 - 1;
-    curve[i] = Math.tanh(k * x) / norm;
+    curve[i] = Math.tanh(x * 1.15) / Math.tanh(1.15);
   }
   return curve;
+}
+
+function makeNoise(ctx: BaseAudioContext, kind: "white" | "pink"): AudioBuffer {
+  const seconds = 2;
+  const buf = ctx.createBuffer(1, Math.floor(ctx.sampleRate * seconds), ctx.sampleRate);
+  const data = buf.getChannelData(0);
+  if (kind === "white") {
+    for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+  } else {
+    // Paul Kellet 粉噪声滤波器(公开领域算法)
+    let b0 = 0, b1 = 0, b2 = 0, b3 = 0, b4 = 0, b5 = 0, b6 = 0;
+    for (let i = 0; i < data.length; i++) {
+      const w = Math.random() * 2 - 1;
+      b0 = 0.99886 * b0 + w * 0.0555179;
+      b1 = 0.99332 * b1 + w * 0.0750759;
+      b2 = 0.969 * b2 + w * 0.153852;
+      b3 = 0.8665 * b3 + w * 0.3104856;
+      b4 = 0.55 * b4 + w * 0.5329522;
+      b5 = -0.7616 * b5 - w * 0.016898;
+      data[i] = (b0 + b1 + b2 + b3 + b4 + b5 + b6 + w * 0.5362) * 0.11;
+      b6 = w * 0.115926;
+    }
+  }
+  return buf;
 }

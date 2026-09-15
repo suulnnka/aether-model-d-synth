@@ -1,56 +1,60 @@
 /**
- * 单音键盘逻辑(PRD AUD-1,last-note priority):
- *  - press:始终响应最后按下的键(重触发)
- *  - release:若仍有按住的键 → 滑回仍按住的最末键(不重触发);否则全部释放
- *  - 乱序松开、重复按下/抬起均安全
+ * 单音键盘逻辑(AUD-1 / AUD-2 / AUD-11):last-note priority。
+ * 纯逻辑类,与音频图解耦,QWERTY / 鼠标 / MIDI 共用同一通道。
  */
 
-export type MonoEvent =
-  | { type: "press"; midi: number } // 新键按下:重触发
-  | { type: "glideTo"; midi: number } // 松开后回退到仍按住的键:只滑音高
-  | { type: "release" } // 全部释放:进入 Release
-  | { type: "panic" };
+export interface KeyboardEvents {
+  /** 新音高触发(新按键,或松键回退到仍按住的最末键) */
+  onPitch(midi: number, retrigger: boolean): void;
+  /** 全部松开 → 进入释放段 */
+  onRelease(): void;
+}
 
 export class MonoKeyboard {
-  private held: number[] = []; // 按下顺序保持
-  constructor(private emit: (e: MonoEvent) => void) {}
+  private stack: number[] = [];
+  private events: KeyboardEvents;
 
-  get current(): number | null {
-    return this.held.length ? this.held[this.held.length - 1] : null;
+  constructor(events: KeyboardEvents) {
+    this.events = events;
   }
 
-  isHeld(midi: number): boolean {
-    return this.held.includes(midi);
+  get currentNote(): number | null {
+    return this.stack.length ? this.stack[this.stack.length - 1] : null;
   }
 
-  press(midi: number): void {
-    this.held = this.held.filter((m) => m !== midi);
-    this.held.push(midi);
-    this.emit({ type: "press", midi });
+  get heldNotes(): readonly number[] {
+    return this.stack;
   }
 
-  release(midi: number): void {
-    const idx = this.held.indexOf(midi);
+  /** 按下:始终响应最后按下的键;每次新按键都重新触发两条包络(AUD-2) */
+  noteOn(midi: number): void {
+    midi = Math.round(midi);
+    // 去重:同一键重复按下视为一次
+    if (this.stack[this.stack.length - 1] === midi) return;
+    this.stack = this.stack.filter((m) => m !== midi);
+    this.stack.push(midi);
+    this.events.onPitch(midi, true);
+  }
+
+  /** 抬起:移除;若抬起的是当前音,回退到仍按住的最末键(滑音,不重触发) */
+  noteOff(midi: number): void {
+    midi = Math.round(midi);
+    const idx = this.stack.indexOf(midi);
     if (idx === -1) return;
-    this.held.splice(idx, 1);
-    if (this.held.length > 0) {
-      this.emit({ type: "glideTo", midi: this.held[this.held.length - 1] });
-    } else {
-      this.emit({ type: "release" });
+    const wasTop = idx === this.stack.length - 1;
+    this.stack.splice(idx, 1);
+    if (this.stack.length === 0) {
+      this.events.onRelease();
+      return;
+    }
+    if (wasTop) {
+      this.events.onPitch(this.stack[this.stack.length - 1], false);
     }
   }
 
   allOff(): void {
-    if (this.held.length === 0) return;
-    this.held = [];
-    this.emit({ type: "panic" });
-  }
-
-  heldNotes(): number[] {
-    return [...this.held];
-  }
-
-  reset(): void {
-    this.held = [];
+    if (this.stack.length === 0) return;
+    this.stack = [];
+    this.events.onRelease();
   }
 }

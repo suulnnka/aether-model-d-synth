@@ -1,9 +1,9 @@
 {
   "name": "aether-model-d",
   "private": true,
-  "version": "1.0.0",
+  "version": "2.0.0",
   "type": "module",
-  "description": "Aether Model D - 3D web synthesizer (Three.js + Web Audio)",
+  "description": "Aether Model D - 3D web synthesizer (Three.js + Web Audio), PRD v3.2 implementation",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",

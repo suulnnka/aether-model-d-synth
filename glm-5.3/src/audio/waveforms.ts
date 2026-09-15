@@ -1,84 +1,93 @@
 /**
- * 带限波形表(PRD AUD-4):6 档波形以傅里叶系数构造 PeriodicWave,
- * 由 WebAudio 实现内部波表带限渲染,杜绝高频混叠。
- * 档位顺序与 §6.2 一致:三角波 / 锯齿 / 反锯齿 / 方波 / 宽脉冲 / 窄脉冲
+ * 带限周期波表(AUD-4):六档波形全部以傅里叶系数构造 PeriodicWave,
+ * ≤128 谐波杜绝混叠。
  */
 
-export type WaveformName =
+export type WaveName =
   | "triangle"
   | "sawtooth"
-  | "reverse-sawtooth"
+  | "rev-saw"
   | "square"
   | "pulse-wide"
   | "pulse-narrow";
 
-const N = 256; // 谐波上限(实现内部还会按播放频率做波表带限)
+export const HARMONICS = 128;
 
-type Coefs = { real: Float32Array; imag: Float32Array };
-
-function makeCoefs(fill: (n: number) => [number, number]): Coefs {
-  const real = new Float32Array(N + 1);
-  const imag = new Float32Array(N + 1);
-  for (let n = 1; n <= N; n++) {
-    const [re, im] = fill(n);
-    real[n] = re;
-    imag[n] = im;
+/**
+ * 返回 [real, imag] 谐波系数(忽略直流项 index 0)。
+ * 采用正弦相位(imag),与标准 Web Audio 波表约定一致。
+ */
+export function harmonicSeries(wave: WaveName): {
+  real: Float32Array;
+  imag: Float32Array;
+} {
+  const real = new Float32Array(HARMONICS + 1);
+  const imag = new Float32Array(HARMONICS + 1);
+  const gain = (n: number) => {
+    // 带限衰减:高次谐波轻微滚降,避免截止处的瞬态振铃
+    const rolloff = 1 - 0.25 * Math.pow(n / HARMONICS, 2);
+    return rolloff;
+  };
+  switch (wave) {
+    case "triangle":
+      // 奇次谐波,1/n² 衰减
+      for (let n = 1; n <= HARMONICS; n += 2) {
+        imag[n] = ((n % 4 === 1 ? 1 : -1) / (n * n)) * (8 / Math.PI ** 2) * gain(n);
+      }
+      break;
+    case "sawtooth":
+    case "rev-saw": {
+      const sign = wave === "sawtooth" ? 1 : -1;
+      for (let n = 1; n <= HARMONICS; n++) {
+        imag[n] = (sign * (n % 2 === 0 ? -1 : 1)) / n * (2 / Math.PI) * gain(n);
+      }
+      break;
+    }
+    case "square":
+      for (let n = 1; n <= HARMONICS; n += 2) {
+        imag[n] = (1 / n) * (4 / Math.PI) * gain(n);
+      }
+      break;
+    case "pulse-wide":
+    case "pulse-narrow": {
+      // 脉冲波:占空比 d 的傅里叶系数 sin(nπd)
+      const d = wave === "pulse-wide" ? 0.25 : 0.08;
+      const norm = 1 / d; // 保持基波能量接近
+      for (let n = 1; n <= HARMONICS; n++) {
+        imag[n] = Math.sin(Math.PI * n * d) / n * norm * 0.5 * gain(n);
+      }
+      break;
+    }
   }
   return { real, imag };
 }
 
-// 三角波:奇次谐波,1/n²,符号 (+,-,+,-,...)
-const TRIANGLE = makeCoefs((n) => {
-  if (n % 2 === 0) return [0, 0];
-  const sign = ((n - 1) / 2) % 2 === 0 ? 1 : -1;
-  return [(8 / (Math.PI * Math.PI)) * (sign / (n * n)), 0];
-});
+const cache = new Map<string, PeriodicWave>();
 
-// 锯齿(升):全谐波 2/n (sine)
-const SAW = makeCoefs((n) => [0, 2 / (n * Math.PI)]);
-// 反锯齿(降)
-const RSAW = makeCoefs((n) => [0, -2 / (n * Math.PI)]);
-// 方波:奇次谐波 4/n (sine)
-const SQUARE = makeCoefs((n) => (n % 2 === 1 ? [0, 4 / (n * Math.PI)] : [0, 0]));
-// 脉冲波(占空比 d):cosine 系数 2/(nπ)·sin(nπd)
-function pulse(duty: number): Coefs {
-  return makeCoefs((n) => [
-    (2 / (n * Math.PI)) * Math.sin(n * Math.PI * duty),
-    0,
-  ]);
-}
-const PULSE_WIDE = pulse(0.25);
-const PULSE_NARROW = pulse(0.1);
-
-const TABLES: Record<WaveformName, Coefs> = {
-  triangle: TRIANGLE,
-  sawtooth: SAW,
-  "reverse-sawtooth": RSAW,
-  square: SQUARE,
-  "pulse-wide": PULSE_WIDE,
-  "pulse-narrow": PULSE_NARROW,
-};
-
-const cache = new WeakMap<BaseAudioContext, Map<string, PeriodicWave>>();
-
-export function getWave(ctx: BaseAudioContext, name: WaveformName): PeriodicWave {
-  let perCtx = cache.get(ctx);
-  if (!perCtx) cache.set(ctx, (perCtx = new Map()));
-  let wave = perCtx.get(name);
-  if (!wave) {
-    const { real, imag } = TABLES[name];
-    wave = ctx.createPeriodicWave(real, imag, { disableNormalization: false });
-    perCtx.set(name, wave);
+export function periodicWave(ctx: BaseAudioContext, wave: WaveName): PeriodicWave {
+  const key = `${ctx.sampleRate}:${wave}`;
+  let pw = cache.get(key);
+  if (!pw) {
+    const { real, imag } = harmonicSeries(wave);
+    pw = ctx.createPeriodicWave(real, imag, {
+      disableNormalization: false,
+    });
+    cache.set(key, pw);
   }
-  return wave;
+  return pw;
 }
 
-/** §6.2 波形档位序号 → 波形名 */
-export const WAVE_NAMES: WaveformName[] = [
-  "triangle",
-  "sawtooth",
-  "reverse-sawtooth",
-  "square",
-  "pulse-wide",
-  "pulse-narrow",
-];
+/** 供离线测试/自检直接采样一个周期的波形 */
+export function sampleWave(wave: WaveName, points = 1024): Float32Array {
+  const { real, imag } = harmonicSeries(wave);
+  const out = new Float32Array(points);
+  for (let i = 0; i < points; i++) {
+    const t = (i / points) * Math.PI * 2;
+    let v = 0;
+    for (let n = 1; n <= HARMONICS; n++) {
+      v += real[n] * Math.cos(n * t) + imag[n] * Math.sin(n * t);
+    }
+    out[i] = v;
+  }
+  return out;
+}
