@@ -1,244 +1,341 @@
 /**
- * ParamStore — 面板参数单一事实来源(ST-1)
- * §6 控件规格总表的注册表:全部控件的类型 / 范围 / 档位 / 默认值都在这里定义。
- * 3D 控件、音频引擎、UI、持久化全部只与本仓库通信。
+ * 单一参数仓库(PRD ST-1)
+ * ------------------------------------------------------------------
+ * 全部面板参数集中在此定义(min / max / default / 档位 / 类型),
+ * 3D 控件与音频引擎只与本仓库通信,互不直接依赖。
+ * 控件清单逐项对应 PRD §15「控件规格总表」(48 项)。
+ *
+ * 取值约定:所有参数以 number 存储(开关为 0/1,档位为下标),
+ * 便于统一持久化、预设套用与 3D 姿态插值。
  */
 
-export type ParamKind = "knob" | "selector" | "switch" | "wheel";
+export type SectionId =
+  | "controllers"
+  | "oscillators"
+  | "mixer"
+  | "modifiers"
+  | "output"
+  | "sidepanel";
 
-export interface ParamDef {
+export type SwitchColor = "orange" | "blue" | "black";
+
+export interface KnobSpec {
+  kind: "knob";
   id: string;
-  kind: ParamKind;
-  /** 中文名(用于 tooltip) */
   label: string;
+  /** 丝印上显示的单位/量纲(仅用于 tooltip) */
+  unit?: string;
+  min: number;
+  max: number;
   def: number;
-  /** 连续参数范围(kind = knob / wheel / switch) */
-  min?: number;
-  max?: number;
-  /** 档位列表(kind = selector),index 即内部值 */
-  steps?: string[];
-  /** 数值显示格式化 */
+  /** 中心为 0 的双极性旋钮(Tune / Frequency / Cutoff),丝印刻度对称 */
+  bipolar?: boolean;
+  /** 数值格式化 */
   format?: (v: number) => string;
-  /** 分区(丝印区域 id) */
-  section: string;
 }
 
-/* ---------- 范围与格式化辅助 ---------- */
-
-export const GLIDE_MIN_S = 0.005;
-export const GLIDE_MAX_S = 2.5;
-/** 0–10 → 5ms–2.5s 指数映射;0 = 关闭 */
-export function glideToSeconds(v: number): number {
-  if (v <= 0.001) return 0;
-  const n = Math.min(1, Math.max(0, v / 10));
-  return GLIDE_MIN_S * Math.pow(GLIDE_MAX_S / GLIDE_MIN_S, n);
+export interface SelectorSpec {
+  kind: "selector";
+  id: string;
+  label: string;
+  /** 档位名(与丝印一致) */
+  options: string[];
+  def: number;
+  /** 波形档位需要在旋钮四周绘制波形图标刻度 */
+  waveformTicks?: boolean;
 }
 
-export const ENV_MIN_S = 0.001;
-export const ENV_MAX_S = 10;
-/** 0–10 → 1ms–10s 对数映射 */
-export function envToSeconds(v: number): number {
-  const n = Math.min(1, Math.max(0, v / 10));
-  return ENV_MIN_S * Math.pow(ENV_MAX_S / ENV_MIN_S, n);
+export interface SwitchSpec {
+  kind: "switch";
+  id: string;
+  label: string;
+  def: 0 | 1;
+  color: SwitchColor;
+  /** 丝印上的下标签(通常 ON) */
+  sub?: string;
+  /** 拨杆两档各自的丝印(如 OSC.3 / FILTER EG) */
+  onLabel?: string;
+  offLabel?: string;
 }
 
-export const CUTOFF_MIN_HZ = 10;
-export const CUTOFF_MAX_HZ = 18000;
-/** 0–10 → 10Hz–18kHz 对数映射 */
-export function cutoffToHz(v: number): number {
-  const n = Math.min(1, Math.max(0, v / 10));
-  return CUTOFF_MIN_HZ * Math.pow(CUTOFF_MAX_HZ / CUTOFF_MIN_HZ, n);
-}
-/** kHz/Hz 显示 */
-function fmtHzKnob(v: number): string {
-  const hz = cutoffToHz(v);
-  return hz >= 1000 ? `${(hz / 1000).toFixed(2)} kHz` : `${hz.toFixed(0)} Hz`;
-}
-function fmtSeconds(v: number): string {
-  const s = envToSeconds(v);
-  return s >= 1 ? `${s.toFixed(2)} s` : `${(s * 1000).toFixed(0)} ms`;
-}
-function fmtPlain(v: number): string {
-  return v.toFixed(1);
-}
-function fmtCents(spanCents: number) {
-  const half = spanCents / 2;
-  return (v: number) => `${v >= 0 ? "+" : ""}${v.toFixed(0)} ¢ (${(-half).toFixed(0)}~${+half.toFixed(0)})`;
+export interface WheelSpec {
+  kind: "wheel";
+  id: string;
+  label: string;
+  min: number;
+  max: number;
+  def: number;
+  /** 弯音轮松手回中 */
+  spring?: boolean;
 }
 
-/* ---------- 档位定义 ---------- */
+export interface RockerSpec {
+  kind: "rocker";
+  id: string;
+  label: string;
+  def: 0 | 1;
+}
 
-export const RANGE_STEPS = ["32'", "16'", "8'", "4'", "2'"];
-export const RANGE_STEPS_OSC3 = ["LO", "32'", "16'", "8'", "4'", "2'"];
-export const WAVE_STEPS = ["三角波", "锯齿波", "反锯齿", "方波", "宽脉冲", "窄脉冲"];
+export type ControlSpec =
+  | KnobSpec
+  | SelectorSpec
+  | SwitchSpec
+  | WheelSpec
+  | RockerSpec;
 
-/* ---------- 控件注册表(§6) ---------- */
-
-const oscDefs = (): ParamDef[] => {
-  const out: ParamDef[] = [];
-  for (const i of [1, 2, 3] as const) {
-    out.push(
-      {
-        id: `osc${i}Range`,
-        kind: "selector",
-        label: `Osc-${i} Range 音域`,
-        def: 2, // 8'
-        steps: i === 3 ? RANGE_STEPS_OSC3 : RANGE_STEPS,
-        section: "osc",
-      },
-      {
-        id: `osc${i}Wave`,
-        kind: "selector",
-        label: `Osc-${i} Waveform 波形`,
-        def: i === 3 ? 1 : 1, // 锯齿(Osc-3 默认三角波见下覆盖)
-        steps: WAVE_STEPS,
-        section: "osc",
-      },
-      {
-        id: `osc${i}Freq`,
-        kind: "knob",
-        label: `Osc-${i} Frequency 微调`,
-        def: i === 2 ? 0.1 : i === 3 ? -0.1 : 0, // +7 / -7 音分(±700 音分 → 0-10)
-        min: -700,
-        max: 700,
-        format: fmtCents(1400),
-        section: "osc",
-      },
-    );
-  }
-  return out;
-};
-
-export const PARAM_DEFS: ParamDef[] = [
-  /* Controllers */
-  { id: "glide", kind: "knob", label: "Glide 滑音", def: 0, min: 0, max: 10, format: (v) => (v < 0.05 ? "关闭" : `${(glideToSeconds(v) * 1000).toFixed(0)} ms`), section: "ctl" },
-  { id: "modMix", kind: "knob", label: "Modulation Mix 调制混合", def: 0, min: 0, max: 10, format: (v) => `${(v / 10 * 100).toFixed(0)}% Noise`, section: "ctl" },
-  { id: "tune", kind: "knob", label: "Tune 主音准", def: 0, min: -200, max: 200, format: fmtCents(400), section: "ctl" },
-  { id: "modOn", kind: "switch", label: "Modulation 调制总开关", def: 0, section: "ctl" },
-  { id: "decayOn", kind: "switch", label: "Decay 衰减开关", def: 0, section: "ctl" },
-
-  /* Oscillator Bank(每列自左向右为 Osc-3 / 2 / 1,见 MDL-5) */
-  ...oscDefs(),
-  { id: "osc3Control", kind: "switch", label: "Osc-3 Control 键盘控制", def: 1, section: "osc" },
-
-  /* Mixer */
-  { id: "osc1Vol", kind: "knob", label: "Osc-1 Volume", def: 8, min: 0, max: 10, format: fmtPlain, section: "mix" },
-  { id: "osc2Vol", kind: "knob", label: "Osc-2 Volume", def: 8, min: 0, max: 10, format: fmtPlain, section: "mix" },
-  { id: "osc3Vol", kind: "knob", label: "Osc-3 Volume", def: 0, min: 0, max: 10, format: fmtPlain, section: "mix" },
-  { id: "noiseVol", kind: "knob", label: "Noise Volume 噪声电平", def: 0, min: 0, max: 10, format: fmtPlain, section: "mix" },
-  { id: "extVol", kind: "knob", label: "Ext In Volume 外部输入", def: 0, min: 0, max: 10, format: fmtPlain, section: "mix" },
-
-  /* Modifiers — Filter */
-  { id: "cutoff", kind: "knob", label: "Cutoff 截止频率", def: 7.2, min: 0, max: 10, format: fmtHzKnob, section: "mod" },
-  { id: "emphasis", kind: "knob", label: "Emphasis 共振", def: 3, min: 0, max: 10, format: fmtPlain, section: "mod" },
-  { id: "contour", kind: "knob", label: "Contour Amount 包络深度", def: 5, min: 0, max: 10, format: fmtPlain, section: "mod" },
-  { id: "filterMod", kind: "switch", label: "Modulation (Osc-3) 滤波调制", def: 0, section: "mod" },
-  { id: "kc1", kind: "switch", label: "Keyboard Control 1 (+100%)", def: 0, section: "mod" },
-  { id: "kc2", kind: "switch", label: "Keyboard Control 2 (+50%)", def: 0, section: "mod" },
-  { id: "fAtt", kind: "knob", label: "Filter Attack", def: 0, min: 0, max: 10, format: fmtSeconds, section: "mod" },
-  { id: "fDec", kind: "knob", label: "Filter Decay", def: 4.78, min: 0, max: 10, format: fmtSeconds, section: "mod" },
-  { id: "fRel", kind: "knob", label: "Filter Release", def: 5.12, min: 0, max: 10, format: fmtSeconds, section: "mod" },
-  { id: "fSus", kind: "switch", label: "Filter Sustain", def: 1, section: "mod" },
-
-  /* Modifiers — Loudness */
-  { id: "lAtt", kind: "knob", label: "Loudness Attack", def: 0, min: 0, max: 10, format: fmtSeconds, section: "mod" },
-  { id: "lDec", kind: "knob", label: "Loudness Decay", def: 4.78, min: 0, max: 10, format: fmtSeconds, section: "mod" },
-  { id: "lRel", kind: "knob", label: "Loudness Release", def: 5.12, min: 0, max: 10, format: fmtSeconds, section: "mod" },
-  { id: "lSus", kind: "switch", label: "Loudness Sustain", def: 1, section: "mod" },
-  { id: "volume", kind: "knob", label: "Volume 主音量", def: 6, min: 0, max: 10, format: fmtPlain, section: "mod" },
-
-  /* 演奏控件 */
-  { id: "power", kind: "switch", label: "Power 电源", def: 1, section: "perf" },
-  { id: "pitchWheel", kind: "wheel", label: "Pitch Wheel 音高轮", def: 0, min: -240, max: 240, format: fmtCents(480), section: "perf" },
-  { id: "modWheel", kind: "wheel", label: "Mod Wheel 调制轮", def: 0, min: 0, max: 1, format: (v) => `${(v * 100).toFixed(0)}%`, section: "perf" },
+/**
+ * 六个波形档位(PRD §15.2 / AUD-3)
+ * 三角 → 锯齿 → 反锯齿 → 方波 → 宽脉冲 → 窄脉冲。
+ * 方波由占空比 50% 的脉冲波生成,宽/窄脉冲分别为 25% / 10% 占空比。
+ */
+export const WAVEFORMS = [
+  "triangle",
+  "sawtooth",
+  "rev_saw",
+  "pulse1",
+  "pulse2",
+  "pulse3",
+] as const;
+export const WAVEFORM_LABELS = [
+  "TRIANGLE",
+  "SAWTOOTH",
+  "REV SAW",
+  "SQUARE",
+  "WIDE PULSE",
+  "NARROW PULSE",
 ];
 
-/* Osc-3 默认波形 = 三角波(index 0) */
-(PARAM_DEFS.find((p) => p.id === "osc3Wave") as ParamDef).def = 0;
+/** 六个音域档位(PRD 附录 B) */
+export const RANGES = ["lo", "32", "16", "8", "4", "2"] as const;
+export const RANGE_LABELS = ["LO", "32'", "16'", "8'", "4'", "2'"];
 
-export const PARAM_DEF_MAP: Map<string, ParamDef> = new Map(PARAM_DEFS.map((d) => [d.id, d]));
+const knob = (
+  id: string,
+  label: string,
+  min: number,
+  max: number,
+  def: number,
+  extra: Partial<KnobSpec> = {}
+): KnobSpec => ({ kind: "knob", id, label, min, max, def, ...extra });
 
-/* ---------- 出厂默认快照 ---------- */
+const sel = (
+  id: string,
+  label: string,
+  options: string[],
+  def: number,
+  waveformTicks = false
+): SelectorSpec => ({ kind: "selector", id, label, options, def, waveformTicks });
 
-export function defaultSnapshot(): Record<string, number> {
-  const snap: Record<string, number> = {};
-  for (const d of PARAM_DEFS) snap[d.id] = d.def;
-  return snap;
-}
+const sw = (
+  id: string,
+  label: string,
+  def: 0 | 1,
+  color: SwitchColor = "orange",
+  extra: Partial<SwitchSpec> = {}
+): SwitchSpec => ({ kind: "switch", id, label, def, color, ...extra });
 
-type Subscriber = (v: number) => void;
+/**
+ * 控件注册表(PRD §15 逐项)
+ * 顺序即 §15 编号顺序,3D 布局在 model/layout.ts 中另行描述。
+ */
+export const CONTROLS: ControlSpec[] = [
+  // ── 15.1 CONTROLLERS ─────────────────────────────────────────────
+  knob("tune", "TUNE", -12, 12, 0, { unit: "semitones", bipolar: true }),
+  knob("glideTime", "GLIDE TIME", 0, 10, 1),
+  knob("modMix", "MODULATION MIX", 0, 10, 10),
+  sw("osc3FilterEgSwitch", "MOD SOURCE A", 0, "orange", {
+    onLabel: "FILTER EG",
+    offLabel: "OSC. 3",
+    sub: "ON",
+  }),
+  sw("noiseLfoSwitch", "MOD SOURCE B", 1, "orange", {
+    onLabel: "LFO",
+    offLabel: "NOISE",
+    sub: "ON",
+  }),
+  sw("oscillatorModulationOn", "OSCILLATOR MODULATION", 0, "orange", {
+    sub: "ON",
+  }),
+
+  // ── 15.2 OSCILLATOR BANK(×3 排) ────────────────────────────────
+  sel("osc1Range", "RANGE", [...RANGE_LABELS], 3),
+  sel("osc1Waveform", "WAVEFORM", [...WAVEFORM_LABELS], 1, true),
+  knob("osc1Frequency", "FREQUENCY", -12, 12, 0, {
+    unit: "semitones",
+    bipolar: true,
+  }),
+  sel("osc2Range", "RANGE", [...RANGE_LABELS], 3),
+  sel("osc2Waveform", "WAVEFORM", [...WAVEFORM_LABELS], 1, true),
+  knob("osc2Frequency", "FREQUENCY", -12, 12, 0, {
+    unit: "semitones",
+    bipolar: true,
+  }),
+  sel("osc3Range", "RANGE", [...RANGE_LABELS], 3),
+  sel("osc3Waveform", "WAVEFORM", [...WAVEFORM_LABELS], 0, true),
+  knob("osc3Frequency", "FREQUENCY", -12, 12, 0, {
+    unit: "semitones",
+    bipolar: true,
+  }),
+  sw("osc3Control", "OSC. 3 CONTROL", 1, "orange", { sub: "ON" }),
+
+  // ── 15.3 MIXER ──────────────────────────────────────────────────
+  sw("osc1On", "OSC. 1", 1, "blue", { sub: "ON" }),
+  sw("osc2On", "OSC. 2", 0, "blue", { sub: "ON" }),
+  sw("osc3On", "OSC. 3", 0, "blue", { sub: "ON" }),
+  knob("osc1Volume", "OSC. 1 VOLUME", 0, 10, 9.5),
+  knob("osc2Volume", "OSC. 2 VOLUME", 0, 10, 5.5),
+  knob("osc3Volume", "OSC. 3 VOLUME", 0, 10, 6),
+  sw("externalOn", "EXT. IN", 0, "blue", { sub: "ON" }),
+  knob("externalVolume", "EXT. IN VOLUME", 0, 10, 5),
+  sw("noiseOn", "NOISE", 0, "blue", { sub: "ON" }),
+  knob("noiseVolume", "NOISE VOLUME", 0, 10, 0),
+  sw("noiseType", "NOISE TYPE", 0, "blue", {
+    onLabel: "PINK",
+    offLabel: "WHITE",
+  }),
+  sw("filterModulationOn", "FILTER MODULATION", 1, "orange", { sub: "ON" }),
+  sw("keyboardControl1", "KEYBOARD CONTROL 1", 1, "orange", { sub: "ON" }),
+  sw("keyboardControl2", "KEYBOARD CONTROL 2", 1, "orange", { sub: "ON" }),
+
+  // ── 15.4 MODIFIERS ──────────────────────────────────────────────
+  knob("filterCutoff", "CUTOFF FREQUENCY", -5, 5, 3.9, { bipolar: true }),
+  knob("filterEmphasis", "EMPHASIS", 0, 10, 0),
+  knob("filterContourAmount", "AMOUNT OF CONTOUR", 0, 10, 4.71),
+  knob("filterAttack", "ATTACK TIME", 0, 10, 0.3),
+  knob("filterDecay", "DECAY TIME", 0, 10, 0),
+  knob("filterSustain", "SUSTAIN LEVEL", 0, 10, 4.5),
+  knob("loudnessAttack", "ATTACK TIME", 0, 10, 0),
+  knob("loudnessDecay", "DECAY TIME", 0, 10, 0),
+  knob("loudnessSustain", "SUSTAIN LEVEL", 0, 10, 10),
+
+  // ── 15.5 OUTPUT ─────────────────────────────────────────────────
+  knob("mainVolume", "VOLUME", 0, 10, 5),
+  sw("tunerOn", "A-440", 0, "blue", { sub: "ON" }),
+  { kind: "rocker", id: "power", label: "POWER", def: 1 },
+
+  // ── 15.6 侧边条与演奏控件 ────────────────────────────────────────
+  knob("lfoRate", "LFO RATE", 0, 10, 3.5),
+  sw("lfoWaveform", "LFO WAVEFORM", 0, "black", {
+    onLabel: "SQUARE",
+    offLabel: "TRIANGLE",
+  }),
+  sw("glideOn", "GLIDE", 1, "black", { sub: "ON" }),
+  sw("decaySwitchOn", "DECAY", 0, "black", { sub: "ON" }),
+  { kind: "wheel", id: "pitchWheel", label: "PITCH", min: 0, max: 100, def: 50, spring: true },
+  { kind: "wheel", id: "modWheel", label: "MOD.", min: 0, max: 100, def: 0 },
+];
+
+export const CONTROL_BY_ID: Record<string, ControlSpec> = {};
+for (const c of CONTROLS) CONTROL_BY_ID[c.id] = c;
+
+/** 非持久化的瞬态项:弯音轮松开回中,不写入 localStorage */
+export const TRANSIENT_IDS = new Set(["pitchWheel"]);
+
+// ─────────────────────────────────────────────────────────────────────
+// 参数仓库
+// ─────────────────────────────────────────────────────────────────────
+
+export type ParamListener = (id: string, value: number) => void;
+export type BulkListener = () => void;
 
 export class ParamStore {
-  private values: Record<string, number> = defaultSnapshot();
-  private subs = new Map<string, Set<Subscriber>>();
+  private values = new Map<string, number>();
+  private listeners = new Set<ParamListener>();
+  private bulkListeners = new Set<BulkListener>();
+
+  constructor() {
+    for (const c of CONTROLS) this.values.set(c.id, c.def);
+  }
+
+  has(id: string): boolean {
+    return this.values.has(id);
+  }
 
   get(id: string): number {
-    return this.values[id];
+    return this.values.get(id) ?? 0;
   }
 
-  /** 直接设值(跳过持久化节流由 persist 层处理) */
-  set(id: string, v: number, opts: { silent?: boolean } = {}): void {
-    const def = PARAM_DEF_MAP.get(id);
-    if (!def) return;
-    if (def.kind === "selector") {
-      const n = def.steps!.length;
+  getBool(id: string): boolean {
+    return this.get(id) >= 0.5;
+  }
+
+  /** 0..1 归一化值(供 3D 姿态插值使用) */
+  getNormalized(id: string): number {
+    const spec = CONTROL_BY_ID[id];
+    if (!spec) return 0;
+    if (spec.kind === "selector") return spec.def / Math.max(1, spec.options.length - 1);
+    const { min, max } = spec as KnobSpec | WheelSpec;
+    return (this.get(id) - min) / (max - min);
+  }
+
+  set(id: string, value: number, silent = false): void {
+    const spec = CONTROL_BY_ID[id];
+    if (!spec) return;
+    let v = value;
+    if (spec.kind === "selector") {
+      const n = spec.options.length;
       v = ((Math.round(v) % n) + n) % n;
+    } else if (spec.kind === "switch" || spec.kind === "rocker") {
+      v = value >= 0.5 ? 1 : 0;
     } else {
-      v = Math.min(def.max!, Math.max(def.min!, v));
+      v = Math.min(spec.max, Math.max(spec.min, v));
     }
-    if (this.values[id] === v) return;
-    this.values[id] = v;
-    if (!opts.silent) this.emit(id, v);
+    if (this.values.get(id) === v) return;
+    this.values.set(id, v);
+    if (!silent) this.emit(id, v);
   }
 
-  selectorStep(id: string): string {
-    const def = PARAM_DEF_MAP.get(id)!;
-    return def.steps![this.values[id]];
+  toggle(id: string): void {
+    this.set(id, this.getBool(id) ? 0 : 1);
   }
 
-  cycle(id: string, dir = 1): void {
-    const def = PARAM_DEF_MAP.get(id)!;
-    this.set(id, (this.values[id] + dir + def.steps!.length) % def.steps!.length);
-  }
-
-  reset(id: string): void {
-    this.set(id, PARAM_DEF_MAP.get(id)!.def);
-  }
-
-  resetAll(): void {
-    this.values = defaultSnapshot();
-    for (const d of PARAM_DEFS) this.emit(d.id, this.values[d.id]);
+  /** 批量写入(预设载入 / 本地恢复),全部写完后只发一次批量通知 */
+  setMany(patch: Record<string, number>): void {
+    let changed = false;
+    for (const [id, raw] of Object.entries(patch)) {
+      const spec = CONTROL_BY_ID[id];
+      if (!spec) continue;
+      let v = raw;
+      if (spec.kind === "selector") {
+        const n = spec.options.length;
+        v = ((Math.round(v) % n) + n) % n;
+      } else if (spec.kind === "switch" || spec.kind === "rocker") {
+        v = raw >= 0.5 ? 1 : 0;
+      } else {
+        v = Math.min(spec.max, Math.max(spec.min, v));
+      }
+      if (this.values.get(id) !== v) {
+        this.values.set(id, v);
+        changed = true;
+      }
+    }
+    if (changed) {
+      for (const fn of this.bulkListeners) fn();
+    }
   }
 
   snapshot(): Record<string, number> {
-    return { ...this.values };
-  }
-
-  load(snap: Record<string, number>): void {
-    for (const d of PARAM_DEFS) {
-      if (typeof snap[d.id] === "number") this.values[d.id] = snap[d.id];
+    const out: Record<string, number> = {};
+    for (const [k, v] of this.values) {
+      if (TRANSIENT_IDS.has(k)) continue;
+      out[k] = v;
     }
-    for (const d of PARAM_DEFS) this.emit(d.id, this.values[d.id]);
+    return out;
   }
 
-  subscribe(id: string, cb: Subscriber): () => void {
-    let set = this.subs.get(id);
-    if (!set) {
-      set = new Set();
-      this.subs.set(id, set);
-    }
-    set.add(cb);
-    return () => set!.delete(cb);
+  subscribe(fn: ParamListener): () => void {
+    this.listeners.add(fn);
+    return () => this.listeners.delete(fn);
   }
 
-  /** 给音频引擎批量初始化用 */
-  bind(id: string, cb: Subscriber): void {
-    cb(this.values[id]);
-    this.subscribe(id, cb);
+  subscribeBulk(fn: BulkListener): () => void {
+    this.bulkListeners.add(fn);
+    return () => this.bulkListeners.delete(fn);
   }
 
-  private emit(id: string, v: number): void {
-    const set = this.subs.get(id);
-    if (set) for (const cb of set) cb(v);
+  private emit(id: string, value: number): void {
+    for (const fn of this.listeners) fn(id, value);
   }
 }
+
+export const params = new ParamStore();

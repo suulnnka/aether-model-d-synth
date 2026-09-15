@@ -1,552 +1,495 @@
 /**
- * 交互系统(INT-1 ~ INT-12)
- * raycast 命中优先于相机手势;手势状态机:idle / drag-knob / drag-wheel /
- * press-keys / drag-hinge / selector-click / selector-drag。
+ * 交互层(interaction/interactions.ts)
+ * ------------------------------------------------------------------
+ * raycast + 指针手势状态机(INT-1..13 / VIEW-2 / HINGE-3)。
+ * 命中优先级:控件 > 琴键 > 面板(拖拽调角)> 相机手势;
+ * **左键永不旋转相机**(VIEW-2):左键未命中任何物体时不做任何事。
  */
 import * as THREE from "three";
-import type { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import type { ParamStore, ParamDef } from "../state/params";
-import type { Synth, KeyInfo } from "../model/synth";
-import type { SynthEngine } from "../audio/engine";
-import { PARAM_DEF_MAP } from "../state/params";
+import type { SceneView } from "../scene/scene";
+import type { SynthModel } from "../model/synth";
+import { CONTROL_BY_ID, params, type ControlSpec } from "../state/params";
+import { engine } from "../audio/engine";
+import { DIM } from "../model/layout";
 
-type Gesture = "idle" | "drag-knob" | "drag-wheel" | "press-keys" | "drag-hinge" | "selector-click" | "selector-drag";
+export type HoverInfo = { id: string; x: number; y: number };
 
-export interface InteractionCallbacks {
-  toggleView: () => void;
-  toggleHinge: () => void;
-  toggleHelp: () => void;
+export interface InteractionHooks {
+  /** 悬停变化(供 tooltip);id 为 null 时隐藏 */
+  onHover(info: HoverInfo | null): void;
+  /** 任意用户手势(用于首次上电 / 启动音频 / 跳过运镜) */
+  onGesture(): void;
+  /** 参数被用户改动(供持久化与 UI 回显) */
+  onChange(id: string): void;
+  /** 外部输入开关打开时请求麦克风授权 */
+  onExternalRequest(): void;
+  /** 面板角度被拖拽改变(HINGE-3),返回角度(度) */
+  onPanelAngle(deg: number): void;
 }
 
-/* ---------- §7 电脑键盘映射 ---------- */
-const KEY_ROW_UPPER: Record<string, number> = {
-  a: 0, w: 1, s: 2, e: 3, d: 4, f: 5, t: 6, g: 7, y: 8, h: 9, u: 10, j: 11,
-  k: 12, o: 13, l: 14, p: 15, ";": 16, "'": 17,
-};
-const KEY_ROW_LOWER: Record<string, number> = {
-  z: 0, x: 2, c: 4, v: 5, b: 7, n: 9, m: 11, ",": 12, ".": 14, "/": 16,
-};
-const MIDI_MIN = 41;
-const MIDI_MAX = 84;
+export interface Interactions {
+  noteOn(midi: number): void;
+  noteOff(midi: number): void;
+  allNotesOff(): void;
+  /** 电源关闭时禁用全部演奏与控件操作(INT-8) */
+  setPower(on: boolean): void;
+  /** 引导进行中可临时挂起 3D 交互 */
+  setSuspended(on: boolean): void;
+  dispose(): void;
+}
 
-export class InteractionManager {
-  private ray = new THREE.Raycaster();
-  private pointer = new THREE.Vector2();
-  private gesture: Gesture = "idle";
-  private gestureControlId: string | null = null;
-  private startY = 0;
-  private startVal = 0;
-  private startDeg = 0;
-  private moved = false;
-  private pressedByPointer = new Set<number>();
-  private keyboardHeld = new Map<string, number>();
-  private octaveShift = 0;
-  private tweens: { obj: THREE.Object3D; prop: "rotation.x" | "rotation.y"; from: number; to: number; t: number; dur: number }[] = [];
-  private hoverId: string | null = null;
-  private hoverKind: "control" | "key" | "wheel" | "hinge" | null = null;
-  private hoverMidi: number | null = null;
-  private origEmissive = new Map<THREE.Mesh, number>();
-  private keyMeshByMidi: Map<number, KeyInfo>;
-  private lastHingeDeg = 50;
-  reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+type DragMode =
+  | { kind: "none" }
+  | { kind: "knob"; id: string; lastY: number }
+  | { kind: "selector"; id: string; cx: number; cy: number; acc: number; lastA: number }
+  | { kind: "wheel"; id: string; lastY: number }
+  | { kind: "key"; midi: number }
+  | { kind: "panel"; lastY: number; startAngle: number }
+  | { kind: "orbit" }
+  | { kind: "pan" };
 
-  constructor(
-    private canvas: HTMLCanvasElement,
-    private store: ParamStore,
-    private synth: Synth,
-    private engine: SynthEngine,
-    private controls: OrbitControls,
-    private tooltip: HTMLDivElement,
-    private cb: InteractionCallbacks
-  ) {
-    this.keyMeshByMidi = new Map(synth.keys.map((k) => [k.midi, k]));
-    this.prepHighlightMaterials();
+const FULL_TRAVEL_PX = 190; // 旋钮/滑轮全量程所需拖动像素
+const WHEEL_STEP = 0.02; // 滚轮微调步进(归一化量程)
+/**
+ * 触摸板双指滑动 → 旋转/平移的灵敏度。
+ * scene.rotate/pan 的参数单位是「像素」,而 wheel 的 delta 本身就是像素量级,
+ * 因此这里只在 1.0 附近微调(略大于 1 让手势更跟手)。
+ */
+const TRACKPAD_GAIN = 1.35;
 
-    canvas.addEventListener("pointerdown", (e) => this.onDown(e));
-    canvas.addEventListener("pointermove", (e) => this.onMove(e));
-    canvas.addEventListener("pointerup", (e) => this.onUp(e));
-    canvas.addEventListener("pointerleave", () => this.clearHover());
-    canvas.addEventListener("wheel", (e) => this.onWheel(e), { passive: false });
-    canvas.addEventListener("dblclick", (e) => this.onDblClick(e));
-    canvas.addEventListener("contextmenu", (e) => e.preventDefault());
-    window.addEventListener("keydown", (e) => this.onKeyDown(e));
-    window.addEventListener("keyup", (e) => this.onKeyUp(e));
-    window.addEventListener("blur", () => this.engine.panic());
-    document.addEventListener("visibilitychange", () => {
-      if (document.hidden) this.engine.panic();
-    });
-  }
+/** 控件 id → 参数 id(A-440 按钮与 ON 拨杆共用 tunerOn) */
+const paramIdOf = (id: string): string => (id === "tunerButton" ? "tunerOn" : id);
 
-  /* ---------- 高亮材质预克隆(INT-7) ---------- */
-  private prepHighlightMaterials() {
-    for (const b of this.synth.bindings) {
-      b.hit.traverse((o) => {
-        if (o instanceof THREE.Mesh) {
-          const mat = o.material as THREE.MeshStandardMaterial;
-          this.origEmissive.set(o as THREE.Mesh, mat.emissiveIntensity);
-        }
-      });
+function specOf(id: string): ControlSpec | undefined {
+  return CONTROL_BY_ID[paramIdOf(id)];
+}
+
+function rangeOf(spec: ControlSpec): { min: number; max: number } {
+  const s = spec as { min?: number; max?: number };
+  return { min: s.min ?? 0, max: s.max ?? 1 };
+}
+
+export function createInteractions(
+  scene: SceneView,
+  model: SynthModel,
+  hooks: InteractionHooks
+): Interactions {
+  const canvas = scene.canvas;
+  const raycaster = new THREE.Raycaster();
+  const ndc = new THREE.Vector2();
+
+  let powerOn = true;
+  let suspended = false;
+  let drag: DragMode = { kind: "none" };
+  let activePointer: number | null = null;
+  let hoverId: string | null = null;
+  let downX = 0;
+  let downY = 0;
+
+  const heldKeys = new Set<number>();
+
+  // ── 拾取 ─────────────────────────────────────────────────────────
+  type Pick =
+    | { type: "control"; id: string }
+    | { type: "key"; midi: number }
+    | { type: "panel"; v: number }
+    | null;
+
+  const setNdc = (ev: PointerEvent | WheelEvent | MouseEvent): void => {
+    const r = canvas.getBoundingClientRect();
+    ndc.x = ((ev.clientX - r.left) / r.width) * 2 - 1;
+    ndc.y = -((ev.clientY - r.top) / r.height) * 2 + 1;
+  };
+
+  const pick = (): Pick => {
+    raycaster.setFromCamera(ndc, scene.camera);
+    // 1) 控件
+    const ctlHits = raycaster.intersectObjects(model.pickables, false);
+    if (ctlHits.length) {
+      const id = ctlHits[0].object.userData.controlId as string | undefined;
+      if (id) return { type: "control", id };
     }
-  }
-
-  private setHighlight(kind: string | null, id: string | number | null) {
-    // 清除旧高亮
-    if (this.hoverId !== null) {
-      const old = this.findGroup(this.hoverId);
-      old?.traverse((o) => {
-        if (o instanceof THREE.Mesh && this.origEmissive.has(o)) {
-          (o.material as THREE.MeshStandardMaterial).emissiveIntensity = this.origEmissive.get(o)!;
-        }
-      });
+    // 2) 琴键
+    const keyHits = raycaster.intersectObjects(model.keybed.hits, false);
+    if (keyHits.length) {
+      const h = keyHits[0];
+      const midi = model.keybed.midiOf(h.object, h.instanceId ?? 0);
+      if (midi !== null) return { type: "key", midi };
     }
-    (this.synth.hingeHandle.material as THREE.MeshStandardMaterial).emissiveIntensity = 0;
-    this.hoverId = null;
-    this.hoverKind = null;
-    this.hoverMidi = null;
-
-    if (kind === "control" && typeof id === "string") {
-      const g = this.findGroup(id);
-      g?.traverse((o) => {
-        if (o instanceof THREE.Mesh) {
-          const mat = o.material as THREE.MeshStandardMaterial;
-          mat.emissiveIntensity = 0.25;
-          this.hoverId = id;
-        }
-      });
-      this.hoverKind = "control";
-    } else if (kind === "hinge") {
-      (this.synth.hingeHandle.material as THREE.MeshStandardMaterial).emissiveIntensity = 0.6;
-      this.hoverKind = "hinge";
-    } else if (kind === "key" && typeof id === "number") {
-      this.hoverKind = "key";
-      this.hoverMidi = id;
-    } else if (kind === "wheel" && typeof id === "string") {
-      this.hoverKind = "wheel";
-      this.hoverId = id;
-      this.setHighlightWheel(id, true);
-    }
-    this.canvas.style.cursor =
-      this.hoverKind === null ? "default" : this.hoverKind === "key" ? "pointer" : "grab";
-  }
-
-  private setHighlightWheel(id: string, on: boolean) {
-    const wheelMesh = this.findWheel(id);
-    wheelMesh?.traverse((o) => {
-      if (o instanceof THREE.Mesh) {
-        const mat = o.material as THREE.MeshStandardMaterial;
-        mat.emissive = mat.emissive || new THREE.Color(0xe08a3c);
-        mat.emissiveIntensity = on ? 0.25 : 0;
-      }
-    });
-  }
-
-  private findGroup(id: string): THREE.Object3D | null {
-    // 面板控件在 hingeGroup 内
-    for (const b of this.synth.bindings) {
-      if (b.id === id) return b.hit.parent;
+    // 3) 铰链面板(HINGE-3)
+    const panelHits = raycaster.intersectObject(model.cabinet.panelFaceMesh, false);
+    if (panelHits.length) {
+      const local = model.cabinet.panelFaceMesh.worldToLocal(panelHits[0].point.clone());
+      return { type: "panel", v: -local.z };
     }
     return null;
-  }
+  };
 
-  private findWheel(id: string): THREE.Object3D | null {
-    let found: THREE.Object3D | null = null;
-    this.synth.root.traverse((o) => {
-      if (!found && o instanceof THREE.Mesh && o.userData.wheelId === id) found = o.parent;
-    });
-    return found;
-  }
+  const isInteractive = (id: string): boolean => {
+    const ctl = model.controls.get(id);
+    return !!ctl && ctl.interactive;
+  };
 
-  private clearHover() {
-    this.setHighlight(null, null);
-    this.tooltip.style.display = "none";
-    if (this.gesture === "idle") this.canvas.style.cursor = "default";
-  }
+  const kindOf = (id: string): string => model.controls.get(id)?.kind ?? "knob";
 
-  /* ---------- 射线 ---------- */
-
-  /** 由 main 注入相机(避免循环依赖) */
-  static cameraRef: { camera: THREE.Camera } = { camera: null as unknown as THREE.Camera };
-
-  private pick(e: PointerEvent | WheelEvent | MouseEvent): { kind: "control" | "key" | "wheel" | "hinge" | null; id: string | number | null } {
-    const rect = this.canvas.getBoundingClientRect();
-    this.pointer.set(
-      ((e.clientX - rect.left) / rect.width) * 2 - 1,
-      -((e.clientY - rect.top) / rect.height) * 2 + 1
-    );
-    this.ray.setFromCamera(this.pointer, InteractionManager.cameraRef.camera);
-    const hits = this.ray.intersectObject(this.synth.root, true);
-    for (const h of hits) {
-      const o = h.object as THREE.Mesh;
-      if (o.userData.isHingeHandle) return { kind: "hinge", id: null };
-      if (typeof o.userData.keyMidi === "number") return { kind: "key", id: o.userData.keyMidi as number };
-      if (typeof o.userData.wheelId === "string") return { kind: "wheel", id: o.userData.wheelId as string };
-      if (typeof o.userData.controlId === "string") return { kind: "control", id: o.userData.controlId as string };
+  // ── 控件写入 ─────────────────────────────────────────────────────
+  /** deltaNorm:归一化量程增量;selector 时按档步进(取符号) */
+  const nudge = (id: string, deltaNorm: number): void => {
+    const spec = specOf(id);
+    if (!spec) return;
+    const pid = paramIdOf(id);
+    if (spec.kind === "selector") {
+      if (deltaNorm === 0) return;
+      params.set(pid, params.get(pid) + Math.sign(deltaNorm));
+    } else {
+      const { min, max } = rangeOf(spec);
+      params.set(pid, params.get(pid) + deltaNorm * (max - min));
     }
-    return { kind: null, id: null };
-  }
+    hooks.onChange(pid);
+  };
 
-  /* ---------- Tooltip(INT-7) ---------- */
+  const resetToDefault = (id: string): void => {
+    const spec = specOf(id);
+    if (!spec) return;
+    params.set(paramIdOf(id), spec.def);
+    hooks.onChange(paramIdOf(id));
+  };
 
-  private showTooltip(e: PointerEvent | MouseEvent, kind: string | null, id: string | number | null) {
-    let text = "";
-    if (kind === "control" && typeof id === "string") {
-      const def = PARAM_DEF_MAP.get(id as string)!;
-      const v = this.store.get(id as string);
-      const fmt = def.format ? def.format(v) : def.kind === "switch" ? (v ? "On" : "Off") : def.steps ? def.steps[v] : v.toFixed(1);
-      text = `${def.label} · ${fmt}`;
-    } else if (kind === "key" && typeof id === "number") {
-      text = `琴键 · ${midiName(id)}`;
-    } else if (kind === "wheel" && typeof id === "string") {
-      const def = PARAM_DEF_MAP.get(id as string)!;
-      text = `${def.label} · ${def.format!(this.store.get(id as string))}`;
-    } else if (kind === "hinge") {
-      text = `面板角度 · 拖动调节(0–60°)`;
-    }
-    if (!text) {
-      this.tooltip.style.display = "none";
+  // ── 指针事件 ─────────────────────────────────────────────────────
+  const onPointerDown = (ev: PointerEvent): void => {
+    hooks.onGesture();
+    if (suspended) return;
+    scene.skipIntro();
+    downX = ev.clientX;
+    downY = ev.clientY;
+
+    // ── 相机手势:右键旋转 / 中键或 Shift+右键平移(VIEW-2)
+    if (ev.button === 2) {
+      drag = ev.shiftKey ? { kind: "pan" } : { kind: "orbit" };
+      beginCapture(ev);
       return;
     }
-    this.tooltip.textContent = text;
-    this.tooltip.style.display = "block";
-    this.tooltip.style.left = `${e.clientX + 14}px`;
-    this.tooltip.style.top = `${e.clientY + 12}px`;
-  }
-
-  /* ---------- 指针事件 ---------- */
-
-  private onDown(e: PointerEvent) {
-    if (e.button !== 0 && e.button !== 2) return;
-    const hit = this.pick(e);
-    this.canvas.setPointerCapture(e.pointerId);
-    this.moved = false;
-
-    switch (hit.kind) {
-      case "control": {
-        const id = hit.id as string;
-        const def = PARAM_DEF_MAP.get(id)!;
-        this.controls.enabled = false; // VIEW-4:控件命中优先于相机
-        if (def.kind === "switch") {
-          // INT-3:单击切换,立即翻转到目标姿态
-          const target = this.store.get(id) >= 0.5 ? 0 : 1;
-          this.store.set(id, target);
-          this.animateSwitch(id, target);
-        } else if (def.kind === "selector") {
-          this.gesture = "selector-click";
-          this.gestureControlId = id;
-          this.startY = e.clientY;
-        } else {
-          this.gesture = "drag-knob";
-          this.gestureControlId = id;
-          this.startY = e.clientY;
-          this.startVal = this.store.get(id);
-        }
-        break;
-      }
-      case "key": {
-        this.controls.enabled = false;
-        this.gesture = "press-keys";
-        this.noteOnVisual(hit.id as number);
-        this.pressedByPointer.add(hit.id as number);
-        this.engine.noteOn(hit.id as number);
-        break;
-      }
-      case "wheel": {
-        this.controls.enabled = false;
-        this.gesture = "drag-wheel";
-        this.gestureControlId = hit.id as string;
-        this.startY = e.clientY;
-        this.startVal = this.store.get(hit.id as string);
-        break;
-      }
-      case "hinge": {
-        this.controls.enabled = false;
-        this.gesture = "drag-hinge";
-        this.startY = e.clientY;
-        this.startDeg = this.currentHingeDeg();
-        break;
-      }
-      default:
-        break; // 相机手势交给 OrbitControls
-    }
-  }
-
-  private onMove(e: PointerEvent) {
-    const dxTotal = 0;
-    void dxTotal;
-    if (this.gesture === "idle") {
-      const hit = this.pick(e);
-      this.setHighlight(hit.kind, hit.id);
-      this.showTooltip(e, hit.kind, hit.id);
-      // 悬停在可交互控件上时禁用相机手势(VIEW-4)
-      this.controls.enabled = hit.kind === null;
+    if (ev.button === 1) {
+      drag = { kind: "pan" };
+      beginCapture(ev);
       return;
     }
-    if (Math.abs(e.clientY - this.startY) > 2 || Math.abs(e.movementX) > 2) this.moved = true;
-    const dy = this.startY - e.clientY; // 上拖为增(INT-1)
+    if (ev.button !== 0) return;
 
-    switch (this.gesture) {
-      case "drag-knob": {
-        const def = PARAM_DEF_MAP.get(this.gestureControlId!)!;
-        const range = def.max! - def.min!;
-        const speed = e.shiftKey ? 0.001 : 0.01; // Shift = ×0.1 精调
-        this.store.set(this.gestureControlId!, this.startVal + dy * speed * range / 10);
-        this.showTooltip(e, "control", this.gestureControlId);
-        break;
+    const hit = powerOn ? pick() : null;
+    if (!hit) return; // 左键未命中:不做任何事(不旋转相机)
+
+    if (hit.type === "control") {
+      if (!isInteractive(hit.id)) return;
+      const kind = kindOf(hit.id);
+      if (kind === "led") return;
+
+      if (kind === "switch" || kind === "rocker" || kind === "button") {
+        const pid = paramIdOf(hit.id);
+        params.toggle(pid); // INT-3 单击切换
+        hooks.onChange(pid);
+        if (pid === "externalOn" && params.getBool("externalOn")) hooks.onExternalRequest();
+        return;
       }
-      case "drag-wheel": {
-        const def = PARAM_DEF_MAP.get(this.gestureControlId!)!;
-        const range = def.max! - def.min!;
-        this.store.set(this.gestureControlId!, this.startVal + (dy / 140) * range);
-        break;
-      }
-      case "drag-hinge": {
-        const deg = Math.min(60, Math.max(0, this.startDeg + dy / 1.1));
-        this.setLiveHinge(deg);
-        this.lastHingeDeg = deg;
-        break;
-      }
-      case "selector-click": {
-        if (this.moved) {
-          this.gesture = "selector-drag";
-          this.dragSelector(e);
-        }
-        break;
-      }
-      case "selector-drag": {
-        this.dragSelector(e);
-        break;
-      }
-      case "press-keys": {
-        // 滑奏(INT-4):按住滑过相邻键
-        const hit = this.pick(e);
-        if (hit.kind === "key" && !this.pressedByPointer.has(hit.id as number)) {
-          for (const midi of this.pressedByPointer) {
-            this.engine.noteOff(midi);
-            this.noteOffVisual(midi);
-          }
-          this.pressedByPointer.clear();
-          this.pressedByPointer.add(hit.id as number);
-          this.noteOnVisual(hit.id as number);
-          this.engine.noteOn(hit.id as number);
-        }
-        break;
-      }
-    }
-  }
 
-  private dragSelector(e: PointerEvent) {
-    // 圆弧方向换档(INT-2):以控件屏幕投影中心计算角度
-    const id = this.gestureControlId!;
-    const def = PARAM_DEF_MAP.get(id)!;
-    const group = this.findGroup(id);
-    if (!group) return;
-    const center = group.getWorldPosition(new THREE.Vector3()).project(InteractionManager.cameraRef.camera as THREE.PerspectiveCamera);
-    const rect = this.canvas.getBoundingClientRect();
-    const sx = ((center.x + 1) / 2) * rect.width + rect.left;
-    const sy = (1 - (center.y + 1) / 2) * rect.height + rect.top;
-    const ang = Math.atan2(e.clientX - sx, e.clientY - sy); // 0 = 朝上
-    const n = def.steps!.length;
-    const step = Math.round(((ang + (135 * Math.PI) / 180) / ((270 * Math.PI) / 180)) * (n - 1));
-    this.store.set(id, Math.min(n - 1, Math.max(0, step)));
-    this.showTooltip(e, "control", id);
-  }
-
-  private onUp(e: PointerEvent) {
-    if (this.gesture === "selector-click" && !this.moved) {
-      // INT-2:单击循环进档
-      this.store.cycle(this.gestureControlId!, 1);
-    }
-    if (this.gesture === "press-keys") {
-      for (const midi of this.pressedByPointer) {
-        this.engine.noteOff(midi);
-        this.noteOffVisual(midi);
-      }
-      this.pressedByPointer.clear();
-    }
-    if (this.gesture === "drag-wheel" && this.gestureControlId === "pitchWheel") {
-      // INT-5:音高轮弹簧回中
-      this.springPitchWheel();
-    }
-    this.gesture = "idle";
-    this.gestureControlId = null;
-    try { this.canvas.releasePointerCapture(e.pointerId); } catch { /* noop */ }
-    const hit = this.pick(e);
-    this.controls.enabled = hit.kind === null;
-  }
-
-  private onWheel(e: WheelEvent) {
-    if (this.hoverKind === "control") {
-      e.preventDefault();
-      e.stopPropagation();
-      const id = this.hoverId as string;
-      const def = PARAM_DEF_MAP.get(id)!;
-      const range = def.max! - def.min!;
-      const fine = e.shiftKey ? 0.2 : 1;
-      this.store.set(id, this.store.get(id) - Math.sign(e.deltaY) * (range / 40) * fine);
-      this.showTooltip(e, "control", id);
-    }
-    // 其余滚轮交给相机缩放;2D 模式旋转/平移已被禁用,仅缩放(VIEW-3)
-  }
-
-  private onDblClick(e: MouseEvent) {
-    const hit = this.pick(e);
-    if (hit.kind === "control") {
-      const id = hit.id as string;
-      const def = PARAM_DEF_MAP.get(id)!;
-      if (def.kind === "knob") {
-        this.store.reset(id); // INT-1:双击恢复默认
-      }
-    }
-  }
-
-  /* ---------- 铰链 ---------- */
-
-  private currentHingeDeg(): number {
-    return this.lastHingeDeg;
-  }
-  private setLiveHinge(deg: number) {
-    this.synth.setHinge(deg);
-  }
-  /** 供外部(快捷键/按钮)立起/放平 */
-  setHingeTarget(deg: number, animate = true) {
-    this.lastHingeDeg = deg;
-    if (!animate || this.reducedMotion) {
-      this.synth.setHinge(deg);
-      return;
-    }
-    const from = this.readHingeAngle();
-    const t0 = performance.now();
-    const dur = 500; // HINGE-2:约 0.5s
-    const step = (t: number) => {
-      const k = Math.min(1, (t - t0) / dur);
-      const e = k < 0.5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2;
-      this.synth.setHinge(from + (deg - from) * e);
-      if (k < 1) requestAnimationFrame(step);
-    };
-    requestAnimationFrame(step);
-  }
-  private readHingeAngle(): number {
-    return THREE.MathUtils.radToDeg(this.synth.hingeGroup.rotation.x);
-  }
-  get rememberedHingeDeg(): number {
-    return this.lastHingeDeg;
-  }
-  set rememberedHingeDeg(v: number) {
-    this.lastHingeDeg = v;
-    this.synth.setHinge(v);
-  }
-
-  /* ---------- 开关 80ms 翻转动画(INT-3) ---------- */
-
-  private animateSwitch(id: string, target: number) {
-    const group = this.findGroup(id);
-    if (!group) return;
-    const lever = group.children.find((c) => c.type === "Group") as THREE.Group | undefined;
-    const rot = lever ?? group;
-    const on = target >= 0.5;
-    if (this.reducedMotion) {
-      rot.rotation.x = on ? -0.38 : 0.38;
-      return;
-    }
-    this.tweens.push({
-      obj: rot, prop: "rotation.x",
-      from: rot.rotation.x,
-      to: on ? -0.38 : 0.38,
-      t: 0, dur: 0.08,
-    });
-  }
-
-  /** 逐帧驱动补间(main 循环调用) */
-  tick(dt: number) {
-    for (let i = this.tweens.length - 1; i >= 0; i--) {
-      const tw = this.tweens[i];
-      tw.t += dt;
-      const k = Math.min(1, tw.t / tw.dur);
-      tw.obj.rotation.x = tw.from + (tw.to - tw.from) * k;
-      if (k >= 1) this.tweens.splice(i, 1);
-    }
-    // 音高轮弹簧回中
-    if (this.pitchSpringing) {
-      const cur = this.store.get("pitchWheel");
-      const next = cur * Math.pow(0.0001, dt);
-      if (Math.abs(next) < 1) {
-        this.store.set("pitchWheel", 0);
-        this.pitchSpringing = false;
+      beginCapture(ev);
+      if (kind === "selector") {
+        // INT-2:按下即记录圆心,抬起时若未拖动则单击进一档
+        drag = { kind: "selector", id: hit.id, cx: ev.clientX, cy: ev.clientY, acc: 0, lastA: 0 };
+      } else if (kind === "wheel") {
+        drag = { kind: "wheel", id: hit.id, lastY: ev.clientY };
       } else {
-        this.store.set("pitchWheel", next);
+        drag = { kind: "knob", id: hit.id, lastY: ev.clientY };
       }
-    }
-  }
-
-  private pitchSpringing = false;
-  private springPitchWheel() {
-    this.pitchSpringing = true;
-  }
-
-  /* ---------- 琴键视觉 ---------- */
-
-  noteOnVisual(midi: number) {
-    const k = this.keyMeshByMidi.get(midi);
-    if (k) k.targetY = k.restY - (k.white ? 0.0035 : 0.003);
-  }
-  noteOffVisual(midi: number) {
-    const k = this.keyMeshByMidi.get(midi);
-    if (k) k.targetY = k.restY;
-  }
-  releaseAllVisual() {
-    for (const k of this.synth.keys) k.targetY = k.restY;
-  }
-
-  /* ---------- 电脑键盘演奏(INT-8 / §7) ---------- */
-
-  private onKeyDown(e: KeyboardEvent) {
-    if (e.metaKey || e.ctrlKey || e.altKey) return;
-    const tag = (e.target as HTMLElement)?.tagName;
-    if (tag === "INPUT" || tag === "TEXTAREA") return;
-    const key = e.key.toLowerCase();
-
-    if (key === " ") {
-      e.preventDefault();
-      this.engine.allNotesOff();
-      this.releaseAllVisual();
-      this.pressedByPointer.clear();
       return;
     }
-    if (key === "v") { e.preventDefault(); this.cb.toggleView(); return; }
-    if (key === "h") { e.preventDefault(); this.cb.toggleHinge(); return; }
-    if (e.key === "?" || (e.shiftKey && key === "/")) { e.preventDefault(); this.cb.toggleHelp(); return; }
-    if (key === "=" || key === "+") { this.octaveShift = Math.min(2, this.octaveShift + 1); return; }
-    if (key === "-") { this.octaveShift = Math.max(-3, this.octaveShift - 1); return; }
 
-    if (e.repeat) return;
-    let midi: number | null = null;
-    if (key in KEY_ROW_UPPER) {
-      midi = 60 + this.octaveShift * 12 + KEY_ROW_UPPER[key];
-    } else if (key in KEY_ROW_LOWER) {
-      midi = 60 + (this.octaveShift - 1) * 12 + KEY_ROW_LOWER[key];
+    if (hit.type === "key") {
+      beginCapture(ev);
+      drag = { kind: "key", midi: hit.midi };
+      noteOn(hit.midi);
+      return;
     }
-    if (midi === null) return;
-    midi = Math.min(MIDI_MAX, Math.max(MIDI_MIN, midi));
-    if (this.keyboardHeld.has(key)) return;
-    e.preventDefault();
-    this.keyboardHeld.set(key, midi);
-    this.noteOnVisual(midi);
-    this.engine.noteOn(midi);
+
+    if (hit.type === "panel") {
+      // 仅前缘区域可拖拽调角,避免误触(HINGE-3)
+      if (hit.v > DIM.PANEL_D * 0.55) {
+        beginCapture(ev);
+        drag = { kind: "panel", lastY: ev.clientY, startAngle: scene.getPanelAngle() };
+      }
+    }
+  };
+
+  const beginCapture = (ev: PointerEvent): void => {
+    activePointer = ev.pointerId;
+    try {
+      canvas.setPointerCapture(ev.pointerId);
+    } catch {
+      /* 某些环境不支持捕获,忽略 */
+    }
+  };
+
+  const endCapture = (ev: PointerEvent): void => {
+    if (activePointer === ev.pointerId) {
+      try {
+        canvas.releasePointerCapture(ev.pointerId);
+      } catch {
+        /* noop */
+      }
+      activePointer = null;
+    }
+  };
+
+  const onPointerMove = (ev: PointerEvent): void => {
+    setNdc(ev);
+
+    if (drag.kind === "orbit" || drag.kind === "pan") {
+      const dx = ev.clientX - downX;
+      const dy = ev.clientY - downY;
+      downX = ev.clientX;
+      downY = ev.clientY;
+      if (drag.kind === "orbit") scene.rotate(dx, dy);
+      else scene.pan(dx, dy);
+      return;
+    }
+
+    if (drag.kind === "knob" || drag.kind === "wheel") {
+      const dy = ev.clientY - drag.lastY;
+      drag.lastY = ev.clientY;
+      const k = ev.shiftKey ? 0.1 : 1; // INT-1 Shift 精调
+      nudge(drag.id, (-dy / FULL_TRAVEL_PX) * k);
+      return;
+    }
+
+    if (drag.kind === "selector") {
+      // INT-2 沿圆弧拖动换档:以按下点为圆心累积角度
+      const a = Math.atan2(ev.clientY - drag.cy, ev.clientX - drag.cx);
+      let d = a - drag.lastA;
+      if (d > Math.PI) d -= Math.PI * 2;
+      if (d < -Math.PI) d += Math.PI * 2;
+      drag.lastA = a;
+      drag.acc += d;
+      const spec = specOf(drag.id);
+      const n = spec && spec.kind === "selector" ? spec.options.length : 6;
+      const step = (Math.PI * 2) / (n * 1.5);
+      while (drag.acc > step) {
+        drag.acc -= step;
+        nudge(drag.id, 1);
+      }
+      while (drag.acc < -step) {
+        drag.acc += step;
+        nudge(drag.id, -1);
+      }
+      return;
+    }
+
+    if (drag.kind === "key") {
+      // INT-4 滑奏:拖过的相邻琴键依次发声
+      const hit = pick();
+      if (hit && hit.type === "key" && hit.midi !== drag.midi) {
+        noteOff(drag.midi);
+        drag = { kind: "key", midi: hit.midi };
+        noteOn(hit.midi);
+      }
+      return;
+    }
+
+    if (drag.kind === "panel") {
+      const dy = ev.clientY - drag.lastY;
+      drag.lastY = ev.clientY;
+      scene.setPanelAngle(drag.startAngle + dy * 0.16, false);
+      hooks.onPanelAngle(scene.getPanelAngle());
+      return;
+    }
+
+    // ── 悬停(INT-7)
+    if (suspended || !powerOn) {
+      setHover(null, ev);
+      return;
+    }
+    const hit = pick();
+    if (hit && hit.type === "control") setHover({ id: hit.id, x: ev.clientX, y: ev.clientY }, ev);
+    else setHover(null, ev);
+  };
+
+  const setHover = (info: HoverInfo | null, ev: PointerEvent): void => {
+    const id = info ? info.id : null;
+    const active = id && isInteractive(id) ? id : null;
+    if (active !== hoverId) {
+      hoverId = active;
+      model.setHighlight(active);
+      canvas.style.cursor = active ? "pointer" : "default";
+    }
+    hooks.onHover(info ? { id: info.id, x: ev.clientX, y: ev.clientY } : null);
+  };
+
+  const onPointerUp = (ev: PointerEvent): void => {
+    if (drag.kind === "key") {
+      noteOff(drag.midi);
+    } else if (drag.kind === "wheel") {
+      const spec = specOf(drag.id);
+      if (spec && spec.kind === "wheel" && spec.spring) {
+        params.set(drag.id, spec.def); // INT-5 弯音轮弹簧回中
+        hooks.onChange(drag.id);
+      }
+    } else if (drag.kind === "selector" && Math.abs(drag.acc) < 0.02) {
+      nudge(drag.id, 1); // 单击循环进档(INT-2)
+    }
+    if (activePointer !== null) endCapture(ev);
+    drag = { kind: "none" };
+  };
+
+  /**
+   * 区分「鼠标滚轮」与「触摸板双指滑动」(VIEW-2 / 触摸板两指拖动旋转):
+   *  - deltaMode !== 0(行/页滚动)一定是鼠标滚轮;
+   *  - 带横向分量、或增量带小数、或短时间内连续事件流 → 触摸板;
+   *  - 增量恰为 100/120 的整数倍且 ≥100 → 典型鼠标滚轮步进。
+   */
+  const wheelTimes: number[] = [];
+  const isTrackpad = (ev: WheelEvent): boolean => {
+    if (ev.deltaMode !== 0) return false;
+    const now = performance.now();
+    while (wheelTimes.length && now - wheelTimes[0] > 350) wheelTimes.shift();
+    wheelTimes.push(now);
+    if (wheelTimes.length >= 3) return true; // 连续事件流 = 触摸板惯性滚动
+    const ax = Math.abs(ev.deltaX);
+    const ay = Math.abs(ev.deltaY);
+    if (ax > 0.5) return true;
+    const m = Math.max(ax, ay);
+    if (m === 0) return false;
+    if (Number.isInteger(m) && m >= 100 && (m % 100 === 0 || m % 120 === 0)) return false;
+    return true;
+  };
+
+  const onWheel = (ev: WheelEvent): void => {
+    ev.preventDefault();
+    setNdc(ev);
+
+    // 捏合(浏览器以 ctrlKey 标记)= 缩放
+    if (ev.ctrlKey) {
+      scene.dolly(ev.deltaY);
+      return;
+    }
+
+    if (powerOn && !suspended) {
+      const hit = pick();
+      if (hit && hit.type === "control" && isInteractive(hit.id)) {
+        const kind = kindOf(hit.id);
+        if (kind === "knob" || kind === "selector" || kind === "wheel") {
+          // INT-1 滚轮微调(悬停在控件上时优先)
+          const dir = ev.deltaY > 0 ? -1 : 1;
+          const unit = kind === "selector" ? 1 : WHEEL_STEP * (ev.shiftKey ? 0.1 : 1);
+          nudge(hit.id, dir * unit);
+          return;
+        }
+      }
+    }
+
+    if (!isTrackpad(ev)) {
+      scene.dolly(ev.deltaY); // 鼠标滚轮 = 缩放(VIEW-2)
+      return;
+    }
+
+    // 触摸板两指滑动:2D 视角锁定旋转,退化为缩放;Shift = 平移
+    if (scene.isLocked()) {
+      scene.dolly(ev.deltaY);
+      return;
+    }
+    if (ev.shiftKey) scene.pan(ev.deltaX * TRACKPAD_GAIN, -ev.deltaY * TRACKPAD_GAIN);
+    else scene.rotate(ev.deltaX * TRACKPAD_GAIN, -ev.deltaY * TRACKPAD_GAIN);
+  };
+
+  const onDoubleClick = (ev: MouseEvent): void => {
+    if (!powerOn || suspended) return;
+    setNdc(ev);
+    const hit = pick();
+    if (!hit || hit.type !== "control") return;
+    const kind = kindOf(hit.id);
+    if (kind === "switch" || kind === "rocker" || kind === "button" || kind === "led") return;
+    resetToDefault(hit.id); // INT-1 双击恢复默认值
+  };
+
+  const onContextMenu = (ev: MouseEvent): void => ev.preventDefault();
+
+  const onPointerLeave = (): void => {
+    if (drag.kind === "none") {
+      hoverId = null;
+      model.setHighlight(null);
+      hooks.onHover(null);
+    }
+  };
+
+  // ── 演奏(鼠标 / QWERTY / MIDI 共用同一通道) ───────────────────────
+  function noteOn(midi: number): void {
+    if (!powerOn) return;
+    if (heldKeys.has(midi)) return;
+    heldKeys.add(midi);
+    model.keybed.setPressed(midi, true);
+    engine.noteOn(midi);
   }
 
-  private onKeyUp(e: KeyboardEvent) {
-    const key = e.key.toLowerCase();
-    const midi = this.keyboardHeld.get(key);
-    if (midi === undefined) return;
-    this.keyboardHeld.delete(key);
-    this.engine.noteOff(midi);
-    this.noteOffVisual(midi);
+  function noteOff(midi: number): void {
+    if (!heldKeys.has(midi)) return;
+    heldKeys.delete(midi);
+    model.keybed.setPressed(midi, false);
+    engine.noteOff(midi);
   }
-}
 
-/* ---------- 工具 ---------- */
+  function allNotesOff(): void {
+    for (const m of [...heldKeys]) noteOff(m);
+    heldKeys.clear();
+    engine.allNotesOff();
+  }
 
-const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
-function midiName(midi: number): string {
-  return `${NOTE_NAMES[midi % 12]}${Math.floor(midi / 12) - 1}`;
+  // INT-10 失焦 / 切标签自动 All Notes Off
+  const onBlur = (): void => allNotesOff();
+  const onVisibility = (): void => {
+    if (document.hidden) allNotesOff();
+  };
+
+  canvas.addEventListener("pointerdown", onPointerDown);
+  canvas.addEventListener("pointermove", onPointerMove);
+  canvas.addEventListener("pointerup", onPointerUp);
+  canvas.addEventListener("pointercancel", onPointerUp);
+  canvas.addEventListener("pointerleave", onPointerLeave);
+  canvas.addEventListener("wheel", onWheel, { passive: false });
+  canvas.addEventListener("dblclick", onDoubleClick);
+  canvas.addEventListener("contextmenu", onContextMenu);
+  window.addEventListener("blur", onBlur);
+  document.addEventListener("visibilitychange", onVisibility);
+
+  return {
+    noteOn,
+    noteOff,
+    allNotesOff,
+    setPower(on) {
+      powerOn = on;
+      if (!on) {
+        allNotesOff();
+        drag = { kind: "none" };
+        model.setHighlight(null);
+        hooks.onHover(null);
+      }
+    },
+    setSuspended(on) {
+      suspended = on;
+      if (on) {
+        drag = { kind: "none" };
+        model.setHighlight(null);
+        hooks.onHover(null);
+      }
+    },
+    dispose() {
+      canvas.removeEventListener("pointerdown", onPointerDown);
+      canvas.removeEventListener("pointermove", onPointerMove);
+      canvas.removeEventListener("pointerup", onPointerUp);
+      canvas.removeEventListener("pointercancel", onPointerUp);
+      canvas.removeEventListener("pointerleave", onPointerLeave);
+      canvas.removeEventListener("wheel", onWheel);
+      canvas.removeEventListener("dblclick", onDoubleClick);
+      canvas.removeEventListener("contextmenu", onContextMenu);
+      window.removeEventListener("blur", onBlur);
+      document.removeEventListener("visibilitychange", onVisibility);
+    },
+  };
 }

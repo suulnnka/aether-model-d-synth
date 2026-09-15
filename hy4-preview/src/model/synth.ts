@@ -1,299 +1,247 @@
 /**
- * 整机程序化建模与装配(MDL-1 ~ MDL-5)
- * 以米为单位,整机宽约 0.56m。
+ * 整机装配(model/synth.ts)
+ * 琴体 + 铰链面板 + 44 键 + 全部面板控件 + 丝印;并把 ParamStore 的变化同步到 3D 姿态。
  */
 import * as THREE from "three";
-import { RoundedBoxGeometry } from "three/examples/jsm/geometries/RoundedBoxGeometry.js";
-import { PARAM_DEFS, ParamStore, type ParamDef } from "../state/params";
-import { PLACEMENT_MAP } from "./layout";
-import { drawSilkscreen } from "./silkscreen";
-import { buildMaterials, type MaterialLib } from "./materials";
-import { createKnob, createSelector, createSwitch, createWheel, type ControlBinding } from "./controls3d";
+import { createMaterials, type MaterialLibrary } from "./materials";
+import { createCabinet, type Cabinet } from "./cabinet";
+import { createKeybed, type Keybed, KEY_START_MIDI } from "./keys";
+import { createControl, type Control3D } from "./controls3d";
+import { createPanelSilkscreenTexture, createSideSilkscreenTexture } from "./silkscreen";
+import { DIM, PANEL_INNER_W, PLACEMENTS, type Placement } from "./layout";
+import { CONTROL_BY_ID, params } from "../state/params";
 
-export const PANEL_W = 0.545;
-export const PANEL_L = 0.2;
-
-export interface KeyInfo {
-  midi: number;
-  mesh: THREE.Mesh;
-  white: boolean;
-  restY: number;
-  targetY: number;
-}
-
-export interface Synth {
+export interface SynthModel {
   root: THREE.Group;
-  hingeGroup: THREE.Group;
-  hingeHandle: THREE.Mesh;
-  keys: KeyInfo[];
-  bindings: ControlBinding[];
-  setHinge(deg: number): void;
-  tick(dt: number): void;
-  led: THREE.Mesh;
-  ledMat: THREE.MeshStandardMaterial;
-  silkTexture: THREE.CanvasTexture;
+  cabinet: Cabinet;
+  keybed: Keybed;
+  materials: MaterialLibrary;
+  controls: Map<string, Control3D>;
+  /** raycast 目标集合 */
+  pickables: THREE.Object3D[];
+  /** 面板空间控件(跟随铰链面板旋转) */
+  panel: THREE.Group;
+  setPanelAngle(deg: number): void;
+  getPanelAngle(): number;
+  setPowerVisual(on: boolean): void;
+  setOverload(on: boolean): void;
+  setTunerActive(on: boolean): void;
+  /** 世界坐标锚点(引导聚光用) */
+  anchorOf(id: string, target: THREE.Vector3): THREE.Vector3 | null;
+  setHighlight(id: string | null): void;
+  syncAll(): void;
+  dispose(): void;
 }
 
-/* ---------- 尺寸 ---------- */
-const CAB_W = 0.56;
-const CAB_H = 0.1;
-const CAB_D = 0.36;
-const HINGE_Z = 0.05; // 铰链轴 z:面板靠键盘(+z,演奏者)一侧的前缘;面板向 -z 伸展,自由缘向上掀起
-const KEY_Z0 = 0.073; // 白键前沿(演奏者在 +z 侧)
-const KEY_LEN = 0.095;
-const WW = 0.01565; // 白键宽
-const WGAP = 0.00055;
+const paramIdOf = (id: string): string => (id === "tunerButton" ? "tunerOn" : id);
 
-function isWhite(midi: number): boolean {
-  return [0, 2, 4, 5, 7, 9, 11].includes(((midi % 12) + 12) % 12);
+function normalizedValue(id: string): number {
+  const spec = CONTROL_BY_ID[id];
+  if (!spec) return 0;
+  if (spec.kind === "selector") {
+    return spec.options.length > 1 ? params.get(id) / (spec.options.length - 1) : 0;
+  }
+  const s = spec as { min: number; max: number };
+  return (params.get(id) - s.min) / (s.max - s.min);
 }
 
-export function buildSynth(store: ParamStore, maxAnisotropy: number): Synth {
-  const m: MaterialLib = buildMaterials();
+export function createSynth(maxAnisotropy = 8): SynthModel {
   const root = new THREE.Group();
+  const materials = createMaterials(maxAnisotropy);
+  const cabinet = createCabinet(materials);
+  root.add(cabinet.root);
 
-  /* ===== 机箱 ===== */
-  const cabinet = new THREE.Mesh(new THREE.BoxGeometry(CAB_W, CAB_H, CAB_D), m.cabinet);
-  cabinet.position.y = CAB_H / 2;
-  cabinet.castShadow = true;
-  cabinet.receiveShadow = true;
-  root.add(cabinet);
+  // ── 丝印 ──
+  const panelSilk = new THREE.Mesh(
+    new THREE.PlaneGeometry(PANEL_INNER_W, DIM.PANEL_D),
+    new THREE.MeshPhysicalMaterial({
+      map: createPanelSilkscreenTexture(maxAnisotropy),
+      transparent: true,
+      metalness: 0.05,
+      roughness: 0.52,
+      depthWrite: false,
+      polygonOffset: true,
+      polygonOffsetFactor: -3,
+      polygonOffsetUnits: -3,
+      envMapIntensity: 0.6,
+    })
+  );
+  panelSilk.rotation.x = -Math.PI / 2;
+  panelSilk.position.set(0, 0.0009, -DIM.PANEL_D / 2);
+  cabinet.panel.add(panelSilk);
 
-  // 键盘凹槽前沿(装饰斜面)
-  const cheekF = new THREE.Mesh(new THREE.BoxGeometry(CAB_W, 0.012, 0.02), m.cabinet);
-  cheekF.position.set(0, 0.006, -CAB_D / 2 + 0.01);
-  root.add(cheekF);
+  const sideW = DIM.SIDE_X1 - DIM.SIDE_X0;
+  const sideD = DIM.KEY_FRONT_Z - DIM.KEY_BACK_Z;
+  const sideSilk = new THREE.Mesh(
+    new THREE.PlaneGeometry(sideW, sideD),
+    new THREE.MeshPhysicalMaterial({
+      map: createSideSilkscreenTexture(maxAnisotropy),
+      transparent: true,
+      metalness: 0.05,
+      roughness: 0.5,
+      depthWrite: false,
+      polygonOffset: true,
+      polygonOffsetFactor: -3,
+      polygonOffsetUnits: -3,
+    })
+  );
+  sideSilk.rotation.x = -Math.PI / 2;
+  sideSilk.position.set(
+    (DIM.SIDE_X0 + DIM.SIDE_X1) / 2,
+    DIM.CASE_H + 0.0084,
+    (DIM.KEY_BACK_Z + DIM.KEY_FRONT_Z) / 2
+  );
+  cabinet.root.add(sideSilk);
 
-  /* ===== 左右木侧板(圆角,MDL-1) ===== */
-  for (const side of [-1, 1]) {
-    const board = new THREE.Mesh(
-      new RoundedBoxGeometry(0.022, 0.118, CAB_D + 0.02, 3, 0.006),
-      m.wood
-    );
-    board.position.set(side * (CAB_W / 2 + 0.008), 0.059, 0);
-    board.castShadow = true;
-    board.receiveShadow = true;
-    root.add(board);
-  }
+  // ── 琴键 ──
+  const keybed = createKeybed(materials);
+  cabinet.root.add(keybed.group);
 
-  /* ===== 铰链面板组(HINGE-1) ===== */
-  const hingeGroup = new THREE.Group();
-  hingeGroup.position.set(0, 0.103, HINGE_Z);
-  root.add(hingeGroup);
+  // ── 控件 ──
+  const controls = new Map<string, Control3D>();
+  const pickables: THREE.Object3D[] = [];
 
-  const silkCanvas = drawSilkscreen();
-  const silkTexture = new THREE.CanvasTexture(silkCanvas);
-  silkTexture.colorSpace = THREE.SRGBColorSpace;
-  silkTexture.anisotropy = maxAnisotropy;
-
-  const panelSideMat = new THREE.MeshStandardMaterial({ color: 0x232426, metalness: 0.8, roughness: 0.45 });
-  // 面板顶面 = 丝印贴图(VIEW-5 / MDL-3)
-  const panelFaceMat = new THREE.MeshStandardMaterial({
-    map: silkTexture,
-    metalness: 0.75,
-    roughness: 0.45,
-  });
-  const panelMats = [panelSideMat, panelSideMat, panelFaceMat, panelSideMat, panelSideMat, panelSideMat];
-  const panel = new THREE.Mesh(new THREE.BoxGeometry(PANEL_W, 0.009, PANEL_L), panelMats);
-  panel.position.set(0, -0.0045, -PANEL_L / 2);
-  panel.castShadow = true;
-  panel.receiveShadow = true;
-  hingeGroup.add(panel);
-
-  // 面板边框(铝质感薄框)
-  const trimMat = new THREE.MeshStandardMaterial({ color: 0xb9b9bd, metalness: 0.9, roughness: 0.3 });
-  for (const [w, h, d, x, z] of [
-    [PANEL_W + 0.006, 0.006, 0.008, 0, -PANEL_L - 0.001],
-    [PANEL_W + 0.006, 0.006, 0.008, 0, 0.001],
-    [0.008, 0.006, PANEL_L, -PANEL_W / 2 - 0.001, -PANEL_L / 2],
-    [0.008, 0.006, PANEL_L, PANEL_W / 2 + 0.001, -PANEL_L / 2],
-  ] as const) {
-    const t = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), trimMat);
-    t.position.set(x, -0.0045, z);
-    hingeGroup.add(t);
-  }
-
-  // 前缘拖拽条带(HINGE-3 命中区)
-  const hingeHandleMat = new THREE.MeshStandardMaterial({
-    color: 0x8f9095, metalness: 0.85, roughness: 0.35, emissive: 0xe08a3c, emissiveIntensity: 0,
-  });
-  const hingeHandle = new THREE.Mesh(new THREE.BoxGeometry(PANEL_W, 0.014, 0.01), hingeHandleMat);
-  hingeHandle.position.set(0, -0.0045, -PANEL_L - 0.006);
-  hingeHandle.userData.isHingeHandle = true;
-  hingeGroup.add(hingeHandle);
-
-  // 面板螺丝(MDL-4)
-  const screwGeo = new THREE.CylinderGeometry(0.0022, 0.0022, 0.001, 10);
-  const screwMat = new THREE.MeshStandardMaterial({ color: 0x9a9a9e, metalness: 0.95, roughness: 0.35 });
-  for (const [sx, sz] of [[-0.265, -0.012], [0.265, -0.012], [-0.265, -0.188], [0.265, -0.188]] as const) {
-    const s = new THREE.Mesh(screwGeo, screwMat);
-    s.position.set(sx, -0.0005, sz);
-    hingeGroup.add(s);
-  }
-
-  // 铰链轴细节(机箱侧两个铰链座)
-  const hingePinGeo = new THREE.CylinderGeometry(0.005, 0.005, 0.02, 12);
-  for (const hx of [-0.24, 0.24]) {
-    const pin = new THREE.Mesh(hingePinGeo, m.hinge);
-    pin.rotation.z = Math.PI / 2;
-    pin.position.set(hx, 0.103, HINGE_Z);
-    root.add(pin);
-  }
-
-  /* ===== 面板控件 ===== */
-  const bindings: ControlBinding[] = [];
-  const controlRoots: THREE.Group[] = [];
-
-  for (const def of PARAM_DEFS) {
-    if (def.section === "perf") continue; // 轮 / 电源单独处理
-    const p = PLACEMENT_MAP.get(def.id);
-    if (!p) continue;
-
-    let built: { group: THREE.Group; update: (v: number) => void; hit: THREE.Object3D };
-    if (def.kind === "selector") built = createSelector(def, m);
-    else if (def.kind === "switch") built = createSwitch(def, m);
-    else built = createKnob(def, m);
-
-    built.group.position.set((p.u - 0.5) * PANEL_W, 0.0005, -(1 - p.v) * PANEL_L);
-    built.group.traverse((o) => {
-      if (o instanceof THREE.Mesh) o.userData.controlId = def.id;
+  for (const p of PLACEMENTS) {
+    const spec = CONTROL_BY_ID[p.id];
+    const kind = p.kind;
+    const ctl = createControl(materials, p.id, kind, {
+      color: p.color ?? (spec && "color" in spec ? (spec.color as "orange" | "blue" | "black") : "orange"),
+      overload: p.id === "overload",
     });
-    hingeGroup.add(built.group);
-    controlRoots.push(built.group);
 
-    const binding: ControlBinding = {
-      id: def.id,
-      kind: def.kind as ControlBinding["kind"],
-      def,
-      update: built.update,
-      hit: built.hit,
-    };
-    bindings.push(binding);
-    store.bind(def.id, (v) => binding.update(v));
-  }
-
-  /* ===== 44 键键盘(F2–C6,MIDI 41–84,MDL/键盘#36) ===== */
-  const keys: KeyInfo[] = [];
-  const keybedY = 0.101;
-  let whiteIdx = 0;
-  // 先数白键总数以居中
-  let totalWhite = 0;
-  for (let midi = 41; midi <= 84; midi++) if (isWhite(midi)) totalWhite++;
-  const keysW = totalWhite * WW + (totalWhite - 1) * WGAP;
-  const x0 = -keysW / 2;
-
-  for (let midi = 41; midi <= 84; midi++) {
-    const white = isWhite(midi);
-    if (white) {
-      const x = x0 + whiteIdx * (WW + WGAP);
-      const geo = new THREE.BoxGeometry(WW, 0.009, KEY_LEN);
-      const mesh = new THREE.Mesh(geo, m.keyWhite);
-      mesh.position.set(x, keybedY + 0.0045, KEY_Z0 + KEY_LEN / 2);
-      mesh.castShadow = true;
-      mesh.receiveShadow = true;
-      mesh.userData.keyMidi = midi;
-      root.add(mesh);
-      keys.push({ midi, mesh, white, restY: mesh.position.y, targetY: mesh.position.y });
-      whiteIdx++;
+    if (p.space === "panel") {
+      ctl.root.position.set(p.u, 0, -p.v);
+      cabinet.panel.add(ctl.root);
     } else {
-      const geo = new THREE.BoxGeometry(WW * 0.62, 0.011, KEY_LEN * 0.64);
-      const mesh = new THREE.Mesh(geo, m.keyBlack);
-      // 黑键位于前一白键右边界
-      const x = x0 + whiteIdx * (WW + WGAP) - (WW + WGAP) / 2;
-      mesh.position.set(x, keybedY + 0.0085, KEY_Z0 + KEY_LEN * 0.33);
-      mesh.castShadow = true;
-      mesh.receiveShadow = true;
-      mesh.userData.keyMidi = midi;
-      root.add(mesh);
-      keys.push({ midi, mesh, white, restY: mesh.position.y, targetY: mesh.position.y });
+      ctl.root.position.set(p.x ?? 0, DIM.CASE_H + 0.008, p.z ?? 0);
+      cabinet.root.add(ctl.root);
     }
+
+    for (const h of ctl.hits) {
+      h.userData.controlId = p.id;
+      pickables.push(h);
+    }
+    ctl.root.userData.controlId = p.id;
+    (ctl.root.userData as { placement?: Placement }).placement = p;
+    controls.set(p.id, ctl);
   }
 
-  // 键盘木托
-  const keybed = new THREE.Mesh(new THREE.BoxGeometry(keysW + 0.01, 0.004, KEY_LEN + 0.012), m.wood);
-  keybed.position.set(0, keybedY - 0.004, KEY_Z0 + KEY_LEN / 2);
-  keybed.receiveShadow = true;
-  root.add(keybed);
+  // ── 悬停高亮环 ──
+  const highlight = new THREE.Mesh(
+    new THREE.RingGeometry(0.0142, 0.0168, 44),
+    new THREE.MeshBasicMaterial({
+      color: 0x8fdcff,
+      transparent: true,
+      opacity: 0.9,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+      depthTest: false,
+    })
+  );
+  highlight.rotation.x = -Math.PI / 2;
+  highlight.visible = false;
+  highlight.renderOrder = 5;
+  root.add(highlight);
 
-  /* ===== 音高轮 / 调制轮(#37/#38) ===== */
-  const pitchWheelBuilt = createWheel(m);
-  pitchWheelBuilt.group.position.set(-0.256, keybedY + 0.012, KEY_Z0 + KEY_LEN / 2 + 0.005);
-  pitchWheelBuilt.group.traverse((o) => {
-    if (o instanceof THREE.Mesh) o.userData.wheelId = "pitchWheel";
-  });
-  root.add(pitchWheelBuilt.group);
-
-  const modWheelBuilt = createWheel(m);
-  modWheelBuilt.group.position.set(-0.232, keybedY + 0.012, KEY_Z0 + KEY_LEN / 2 + 0.005);
-  modWheelBuilt.group.traverse((o) => {
-    if (o instanceof THREE.Mesh) o.userData.wheelId = "modWheel";
-  });
-  root.add(modWheelBuilt.group);
-
-  store.bind("pitchWheel", (v) => {
-    pitchWheelBuilt.wheel.rotation.x = -(v / 240) * 2.2;
-  });
-  store.bind("modWheel", (v) => {
-    modWheelBuilt.wheel.rotation.x = -v * 2.2;
-  });
-
-  /* ===== 电源开关 + 指示灯(#39,VIS-6,左侧板) ===== */
-  const powerGroup = new THREE.Group();
-  powerGroup.position.set(-CAB_W / 2 - 0.008, 0.118, 0.06);
-  const powerBase = new THREE.Mesh(new THREE.BoxGeometry(0.014, 0.004, 0.022), m.switchBase);
-  powerBase.position.y = 0.002;
-  powerBase.userData.controlId = "power";
-  powerGroup.add(powerBase);
-  const powerLever = new THREE.Group();
-  const powerPlate = new THREE.Mesh(new THREE.BoxGeometry(0.01, 0.004, 0.016), m.switchLever);
-  powerPlate.position.y = 0.006;
-  powerPlate.userData.controlId = "power";
-  powerLever.add(powerPlate);
-  powerGroup.add(powerLever);
-  root.add(powerGroup);
-
-  const ledMat = new THREE.MeshStandardMaterial({
-    color: 0x331100, emissive: 0xff7a1a, emissiveIntensity: 0, roughness: 0.4,
-  });
-  const led = new THREE.Mesh(new THREE.CylinderGeometry(0.0035, 0.0035, 0.004, 12), ledMat);
-  led.position.set(-CAB_W / 2 - 0.008, 0.118, 0.11);
-  root.add(led);
-
-  store.bind("power", (on) => {
-    powerLever.rotation.x = on ? -0.38 : 0.38;
-    ledMat.emissiveIntensity = on ? 2.4 : 0;
-  });
-
-  /* ===== 后面板装饰插孔(MDL-1) ===== */
-  const jackGeo = new THREE.CylinderGeometry(0.006, 0.006, 0.008, 14);
-  for (let i = 0; i < 5; i++) {
-    const jack = new THREE.Mesh(jackGeo, m.jack);
-    jack.rotation.x = Math.PI / 2;
-    jack.position.set(-0.18 + i * 0.05, 0.062, CAB_D / 2 + 0.002);
-    root.add(jack);
-  }
-
-  /* ===== 铰链角状态 ===== */
-  let hingeDeg = 0;
-  const setHinge = (deg: number) => {
-    hingeDeg = Math.min(60, Math.max(0, deg));
-    hingeGroup.rotation.x = THREE.MathUtils.degToRad(hingeDeg); // 正角:自由缘(v=0,-z 侧)向上掀起,面朝演奏者(+z)
+  // ── 参数 → 3D ──
+  const syncOne = (id: string): void => {
+    const ctl = controls.get(id);
+    if (!ctl) return;
+    if (id === "overload" || id === "powerLed") return;
+    ctl.setValue(normalizedValue(paramIdOf(id)));
   };
 
-  /* ===== 逐帧动画(琴键下沉/回弹) ===== */
-  const tick = (dt: number) => {
-    const k = Math.min(1, dt * 28);
-    for (const key of keys) {
-      if (Math.abs(key.mesh.position.y - key.targetY) > 1e-5) {
-        key.mesh.position.y += (key.targetY - key.mesh.position.y) * k;
+  const syncAll = (): void => {
+    for (const id of controls.keys()) syncOne(id);
+    controls.get("powerLed")?.setActive?.(params.getBool("power"));
+    controls.get("tunerButton")?.setValue(params.getBool("tunerOn") ? 1 : 0);
+  };
+
+  params.subscribe((id) => {
+    syncOne(id);
+    // A-440 按钮 / 电源灯跟随
+    if (id === "tunerOn") syncOne("tunerButton");
+    if (id === "power") {
+      syncOne("power");
+      controls.get("powerLed")?.setActive?.(params.getBool("power"));
+      setPowerVisual(params.getBool("power"));
+    }
+  });
+  params.subscribeBulk(syncAll);
+
+  let panelAngle = 50;
+  const setPanelAngle = (deg: number): void => {
+    panelAngle = Math.min(60, Math.max(0, deg));
+    cabinet.panel.rotation.x = (panelAngle * Math.PI) / 180;
+  };
+  setPanelAngle(panelAngle);
+
+  const scrimMats = [cabinet.scrimPanel.material as THREE.MeshBasicMaterial, cabinet.scrimSide.material as THREE.MeshBasicMaterial];
+  function setPowerVisual(on: boolean): void {
+    for (const m of scrimMats) {
+      m.opacity = on ? 0 : 0.5;
+      m.visible = !on;
+    }
+    cabinet.scrimPanel.visible = !on;
+    cabinet.scrimSide.visible = !on;
+    controls.get("powerLed")?.setActive?.(on);
+  }
+
+  syncAll();
+  setPowerVisual(params.getBool("power"));
+
+  const tmpV = new THREE.Vector3();
+  const tmpQ = new THREE.Quaternion();
+
+  return {
+    root,
+    cabinet,
+    keybed,
+    materials,
+    controls,
+    pickables,
+    panel: cabinet.panel,
+    setPanelAngle,
+    getPanelAngle: () => panelAngle,
+    setPowerVisual,
+    setOverload(on) {
+      controls.get("overload")?.setActive?.(on);
+    },
+    setTunerActive(on) {
+      controls.get("tunerButton")?.setValue(on ? 1 : 0);
+    },
+    anchorOf(id, target) {
+      if (id.startsWith("key:")) {
+        const midi = parseInt(id.slice(4), 10);
+        keybed.worldPosition(midi, target);
+        return root.localToWorld(target);
       }
-    }
+      const ctl = controls.get(id);
+      if (!ctl) return null;
+      ctl.root.getWorldPosition(target);
+      target.y += 0.02;
+      return target;
+    },
+    setHighlight(id) {
+      const ctl = id ? controls.get(id) : null;
+      if (!ctl) {
+        highlight.visible = false;
+        return;
+      }
+      ctl.root.getWorldPosition(tmpV);
+      ctl.root.getWorldQuaternion(tmpQ);
+      highlight.position.copy(tmpV);
+      highlight.position.y += 0.001;
+      highlight.quaternion.copy(tmpQ);
+      highlight.rotateX(-Math.PI / 2);
+      highlight.scale.setScalar(ctl.kind === "wheel" ? 1.5 : 1);
+      highlight.visible = true;
+    },
+    syncAll,
+    dispose() {
+      materials.dispose();
+    },
   };
-
-  return { root, hingeGroup, hingeHandle, keys, bindings, setHinge, tick, led, ledMat, silkTexture };
 }
 
-/** 控件 def 查找(交互层用) */
-export function findDef(id: string): ParamDef {
-  return PARAM_DEFS.find((d) => d.id === id)!;
-}
+export { KEY_START_MIDI };

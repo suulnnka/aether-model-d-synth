@@ -30,3 +30,7 @@ Thumbs.db
 
 # AI 工具本地目录
 .workbuddy/
+
+# 开发过程产物(冒烟截图、验证与一次性脚本)
+hy4-preview/shot-3d.png
+hy4-preview/tools/

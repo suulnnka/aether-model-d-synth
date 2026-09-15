@@ -1,12 +1,36 @@
-/* Aether Model D — 覆盖层样式(可聚焦 DOM,对比度 ≥ 4.5:1) */
+/* Aether Model D —— 覆盖层样式
+   基调:低饱和深调 + 暖色强调(与 3D 场景一致);文字对比度 ≥ 4.5:1。 */
+:root {
+  --ink: #f2eee6;
+  --ink-dim: #b6b0a6;
+  --panel: rgba(22, 24, 29, 0.82);
+  --panel-solid: #16181d;
+  --line: rgba(255, 255, 255, 0.12);
+  --accent: #e2913f;
+  --accent-ink: #1a140c;
+  --radius: 10px;
+  --shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+  --font: "Inter", "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+}
 
-html, body {
+* {
+  box-sizing: border-box;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+html,
+body {
   margin: 0;
   padding: 0;
+  height: 100%;
+  background: #0f1114;
+  color: var(--ink);
+  font-family: var(--font);
   overflow: hidden;
-  background: #0c0d10;
-  font-family: "Segoe UI", system-ui, sans-serif;
-  color: #e8e4da;
+  -webkit-font-smoothing: antialiased;
 }
 
 #app {
@@ -14,157 +38,472 @@ html, body {
   inset: 0;
 }
 
-canvas.webgl {
-  display: block;
-  touch-action: none;
+.stage {
+  position: absolute;
+  inset: 0;
 }
 
-/* ---------- 覆盖层容器 ---------- */
-#app > div:not(.aether-layer) { pointer-events: none; }
+.ui-root {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 10;
+  font-size: 13px;
+}
 
-.aether-topright {
-  position: fixed;
-  top: 14px;
-  right: 14px;
+.ui-root button {
+  font-family: inherit;
+  font-size: inherit;
+  color: var(--ink);
+  cursor: pointer;
+}
+
+/* ── 工具栏 ───────────────────────────────────────────────────── */
+.toolbar {
+  position: absolute;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
   display: flex;
   gap: 8px;
-  z-index: 20;
+  pointer-events: auto;
 }
 
-.aether-bottomleft {
-  position: fixed;
-  left: 14px;
-  bottom: 14px;
-  z-index: 20;
-}
-
-.aether-btn {
-  appearance: none;
-  border: 1px solid rgba(230, 226, 216, 0.35);
-  background: rgba(20, 21, 25, 0.82);
-  color: #ece8dd;
-  font: 500 13px/1 "Segoe UI", system-ui, sans-serif;
-  padding: 8px 14px;
-  border-radius: 8px;
-  cursor: pointer;
-  backdrop-filter: blur(6px);
-  transition: background 0.15s ease, border-color 0.15s ease;
-  min-width: 34px;
-  min-height: 34px;
-}
-.aether-btn:hover, .aether-btn:focus-visible {
-  background: rgba(224, 138, 60, 0.25);
-  border-color: rgba(224, 138, 60, 0.7);
-  outline: none;
-}
-
-.aether-badge {
-  position: fixed;
-  top: 14px;
-  left: 14px;
-  z-index: 20;
-  background: rgba(120, 70, 10, 0.85);
-  color: #ffe9d0;
-  font: 500 12px/1 "Segoe UI", sans-serif;
-  padding: 7px 12px;
-  border-radius: 8px;
-  border: 1px solid rgba(255, 170, 90, 0.5);
-}
-
-/* ---------- Tooltip ---------- */
-.aether-tooltip {
-  position: fixed;
-  z-index: 30;
-  display: none;
-  pointer-events: none;
-  background: rgba(15, 16, 20, 0.92);
-  border: 1px solid rgba(230, 226, 216, 0.25);
-  color: #f0ece1;
-  font: 500 12px/1.4 "Segoe UI", sans-serif;
-  padding: 5px 9px;
-  border-radius: 6px;
-  white-space: nowrap;
-}
-
-/* ---------- 帮助 ---------- */
-.aether-help {
-  position: fixed;
-  left: 50%;
-  bottom: 60px;
-  transform: translateX(-50%);
-  width: min(560px, 92vw);
-  max-height: 70vh;
-  overflow: auto;
-  z-index: 40;
-  background: rgba(18, 19, 23, 0.95);
-  border: 1px solid rgba(230, 226, 216, 0.25);
-  border-radius: 14px;
-  padding: 20px 24px;
+.tb-btn {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 8px 16px;
+  letter-spacing: 0.04em;
   backdrop-filter: blur(10px);
+  transition: background 0.16s ease, border-color 0.16s ease, transform 0.12s ease;
 }
-.aether-help h2 { margin: 0 0 10px; font-size: 17px; letter-spacing: 0.05em; color: #f2eee2; }
-.aether-help h3 { margin: 14px 0 6px; font-size: 13px; color: #e0a35c; text-transform: uppercase; letter-spacing: 0.12em; }
-.aether-help ul { margin: 0; padding-left: 18px; font-size: 13px; line-height: 1.75; color: #cfcbc0; }
-.aether-help code {
-  background: rgba(255, 255, 255, 0.08);
-  border-radius: 4px;
-  padding: 1px 5px;
+
+.tb-btn:hover {
+  background: rgba(40, 43, 50, 0.92);
+  border-color: rgba(226, 145, 63, 0.55);
+}
+
+.tb-btn:active {
+  transform: translateY(1px);
+}
+
+.tb-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ── 预设下拉 ─────────────────────────────────────────────────── */
+.preset-menu {
+  position: absolute;
+  top: 54px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(680px, calc(100vw - 32px));
+  max-height: min(62vh, 520px);
+  overflow-y: auto;
+  background: var(--panel-solid);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  box-shadow: var(--shadow);
+  padding: 10px;
+  pointer-events: auto;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 4px;
+  z-index: 3;
+}
+
+.pm-cat {
+  grid-column: 1 / -1;
+  color: var(--accent);
+  font-size: 11px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  padding: 10px 8px 4px;
+}
+
+.pm-item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 7px 9px;
+  text-align: left;
+}
+
+.pm-item:hover {
+  background: rgba(226, 145, 63, 0.14);
+  border-color: rgba(226, 145, 63, 0.4);
+}
+
+.pm-item:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.pm-name {
+  font-weight: 600;
+}
+
+.pm-desc {
+  color: var(--ink-dim);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+/* ── 右上视角控制 ─────────────────────────────────────────────── */
+.view-ctl {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  display: flex;
+  gap: 8px;
+  pointer-events: auto;
+}
+
+/* ── 状态条 ───────────────────────────────────────────────────── */
+.status-bar {
+  position: absolute;
+  bottom: 14px;
+  left: 16px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 12px;
+  color: var(--ink-dim);
+  font-size: 12px;
+  backdrop-filter: blur(8px);
+}
+
+/* ── tooltip ──────────────────────────────────────────────────── */
+.tooltip {
+  position: fixed;
+  top: 0;
+  left: 0;
+  max-width: 288px;
+  background: rgba(16, 18, 22, 0.95);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 9px 12px;
+  box-shadow: var(--shadow);
+  line-height: 1.5;
+  pointer-events: none;
+  z-index: 20;
+}
+
+.tooltip b {
+  color: var(--ink);
+  letter-spacing: 0.05em;
+}
+
+.tooltip i {
+  color: var(--accent);
+  font-style: normal;
+}
+
+.tooltip span {
+  display: block;
+  margin-top: 5px;
+  color: var(--ink-dim);
   font-size: 12px;
 }
-.aether-help-actions { display: flex; gap: 8px; margin-top: 16px; }
 
-/* ---------- 首次引导 ---------- */
-.aether-guide {
+/* ── 键位说明弹层 ─────────────────────────────────────────────── */
+.modal {
+  position: absolute;
+  inset: 0;
+  background: rgba(8, 9, 12, 0.66);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: auto;
+  z-index: 30;
+  backdrop-filter: blur(3px);
+}
+
+.modal-card {
+  position: relative;
+  width: min(560px, calc(100vw - 40px));
+  max-height: 78vh;
+  overflow-y: auto;
+  background: var(--panel-solid);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 26px 28px 28px;
+  box-shadow: var(--shadow);
+}
+
+.modal-card h3 {
+  margin: 18px 0 10px;
+  font-size: 12px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.modal-card h3:first-child {
+  margin-top: 0;
+}
+
+.km-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.km-row {
+  display: flex;
+  gap: 14px;
+  align-items: baseline;
+  padding: 5px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.km-k {
+  flex: 0 0 190px;
+  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+  color: var(--ink);
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 6px;
+  padding: 3px 8px;
+}
+
+.km-d {
+  color: var(--ink-dim);
+  font-size: 12px;
+}
+
+.modal-close {
+  position: absolute;
+  top: 10px;
+  right: 14px;
+  background: transparent;
+  border: none;
+  font-size: 22px;
+  line-height: 1;
+  color: var(--ink-dim);
+  padding: 4px 8px;
+  border-radius: 8px;
+}
+
+.modal-close:hover {
+  color: var(--ink);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+/* ── 首启引导 ─────────────────────────────────────────────────── */
+.onboard {
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+  pointer-events: none;
+}
+
+.ob-spot {
+  position: absolute;
+  border-radius: 50%;
+  border: 2px solid rgba(226, 145, 63, 0.85);
+  box-shadow: 0 0 0 9999px rgba(6, 7, 9, 0.66), 0 0 26px rgba(226, 145, 63, 0.45) inset;
+  opacity: 0;
+  transition: all 0.32s cubic-bezier(0.4, 0, 0.2, 1);
+  pointer-events: none;
+}
+
+.ob-card {
+  position: absolute;
+  left: 50%;
+  bottom: 48px;
+  transform: translateX(-50%);
+  width: min(520px, calc(100vw - 40px));
+  background: var(--panel-solid);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 20px 22px 18px;
+  box-shadow: var(--shadow);
+  pointer-events: auto;
+}
+
+.ob-card.centered {
+  top: 50%;
+  bottom: auto;
+  transform: translate(-50%, -50%);
+}
+
+.ob-card.flip-up {
+  top: 40px;
+  bottom: auto;
+  transform: translateX(-50%);
+}
+
+.ob-step {
+  font-size: 11px;
+  letter-spacing: 0.2em;
+  color: var(--accent);
+  margin-bottom: 8px;
+}
+
+.ob-title {
+  margin: 0 0 8px;
+  font-size: 19px;
+  font-weight: 600;
+}
+
+.ob-body {
+  margin: 0 0 16px;
+  color: var(--ink-dim);
+  line-height: 1.65;
+}
+
+.ob-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ob-spacer {
+  flex: 1;
+}
+
+.ob-actions button {
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 7px 14px;
+}
+
+.ob-actions button:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.13);
+}
+
+.ob-actions button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.ob-actions .primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-ink);
+  font-weight: 600;
+}
+
+.ob-actions .primary:hover {
+  background: #f0a24f;
+}
+
+.ob-actions button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ── toast / 音频提示 ─────────────────────────────────────────── */
+.toast-host {
+  position: absolute;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: center;
+  pointer-events: none;
+}
+
+.toast {
+  background: rgba(16, 18, 22, 0.95);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 9px 18px;
+  box-shadow: var(--shadow);
+  opacity: 0;
+  transform: translateY(8px);
+  transition: opacity 0.26s ease, transform 0.26s ease;
+}
+
+.toast.in {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.audio-hint {
+  position: absolute;
+  bottom: 28px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(226, 145, 63, 0.16);
+  border: 1px solid rgba(226, 145, 63, 0.5);
+  color: #f6d9b4;
+  border-radius: 999px;
+  padding: 9px 20px;
+  letter-spacing: 0.04em;
+  animation: hintPulse 2.4s ease-in-out infinite;
+}
+
+@keyframes hintPulse {
+  0%,
+  100% {
+    opacity: 0.75;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+/* ── 窄屏提示页 ───────────────────────────────────────────────── */
+.mobile-gate {
   position: fixed;
   inset: 0;
-  z-index: 50;
   display: flex;
-  align-items: flex-end;
+  align-items: center;
   justify-content: center;
-  padding-bottom: 12vh;
-  background: rgba(5, 6, 8, 0.35);
+  background: radial-gradient(circle at 50% 40%, #20242c 0%, #0e1013 70%);
+  padding: 24px;
+  z-index: 100;
 }
-.aether-guide-card {
-  background: rgba(20, 21, 26, 0.96);
-  border: 1px solid rgba(224, 138, 60, 0.45);
-  border-radius: 14px;
-  padding: 22px 28px;
+
+.mg-card {
   text-align: center;
   max-width: 420px;
-  font-size: 14px;
-  line-height: 2;
-  color: #e8e4da;
 }
-.aether-guide-card b { color: #f2eee2; letter-spacing: 0.08em; }
-.aether-guide-card p { margin: 10px 0 16px; }
 
-/* ---------- 声音激活提示 ---------- */
-.aether-soundhint {
-  position: fixed;
-  left: 50%;
-  top: 58%;
-  transform: translate(-50%, -50%);
-  z-index: 45;
-  pointer-events: none; /* 不阻挡画布交互,声音激活由 window 监听 */
-  background: rgba(20, 21, 26, 0.92);
-  border: 1px solid rgba(224, 138, 60, 0.6);
-  color: #ffdba8;
-  font: 500 15px/1 "Segoe UI", sans-serif;
-  padding: 14px 22px;
-  border-radius: 999px;
-  animation: hintpulse 2s ease-in-out infinite;
+.mg-brand {
+  font-size: 24px;
+  letter-spacing: 0.5em;
+  text-indent: 0.5em;
+  font-weight: 300;
+  color: #d8d2c8;
+  margin-bottom: 26px;
 }
-@keyframes hintpulse {
-  0%, 100% { opacity: 0.75; }
-  50% { opacity: 1; }
+
+.mg-brand small {
+  display: block;
+  font-size: 11px;
+  letter-spacing: 0.3em;
+  color: #7a756c;
+  margin-top: 8px;
 }
+
+.mg-card p {
+  font-size: 18px;
+  margin: 0 0 12px;
+}
+
+.mg-card span {
+  color: var(--ink-dim);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
 @media (prefers-reduced-motion: reduce) {
-  .aether-soundhint { animation: none; }
-}
-
-/* hidden 属性不被 flex/display 覆盖 */
-.aether-guide[hidden],
-.aether-soundhint[hidden],
-.aether-help[hidden] {
-  display: none !important;
+  .ob-spot,
+  .toast,
+  .audio-hint {
+    transition: none !important;
+    animation: none !important;
+  }
 }
