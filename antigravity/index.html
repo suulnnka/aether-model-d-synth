@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Aether Model D — 3D Analog Monophonic Synthesizer</title>
+    <link
+      rel="icon"
+      type="image/svg+xml"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%2314120f'/%3E%3Crect x='9' y='9' width='14' height='14' rx='2' transform='rotate(45 16 16)' fill='none' stroke='%23e8a33d' stroke-width='3'/%3E%3C/svg%3E"
+    />
+    <meta
+      name="description"
+      content="Aether Model D: interactive 3D vintage monophonic analog synthesizer powered by Three.js, Web Audio API, and AudioWorklet ladder filter."
+    />
+  </head>
+  <body>
+    <div id="app">
+      <div id="stage" aria-label="Aether Model D 3D Synthesizer Canvas"></div>
+      <div id="boot-screen" class="boot-screen">
+        <div class="boot-card">
+          <div class="boot-brand">AETHER <span>MODEL D</span></div>
+          <div class="boot-sub">Initializing 3D Chassis &amp; Analog DSP…</div>
+          <div class="boot-bar"><div id="boot-progress" class="boot-fill"></div></div>
+        </div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

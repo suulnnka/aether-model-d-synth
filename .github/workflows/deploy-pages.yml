@@ -30,12 +30,13 @@ jobs:
             deepseek-v4.1-flash/package-lock.json
             glm-5.3/package-lock.json
             hy4-preview/package-lock.json
+            antigravity/package-lock.json
 
-      # 三个子项目的 vite 均配置 base: "./",构建产物可托管在任意子路径
+      # 各个子项目的 vite 均配置 base: "./",构建产物可托管在任意子路径
       - name: Install and build all sub-projects
         run: |
           set -euo pipefail
-          for project in deepseek-v4.1-flash glm-5.3 hy4-preview; do
+          for project in deepseek-v4.1-flash glm-5.3 hy4-preview antigravity; do
             echo "::group::$project: npm ci && npm run build"
             (cd "$project" && npm ci && npm run build)
             echo "::endgroup::"
@@ -47,7 +48,7 @@ jobs:
           mkdir -p site
           cp index.html site/
           touch site/.nojekyll
-          for project in deepseek-v4.1-flash glm-5.3 hy4-preview; do
+          for project in deepseek-v4.1-flash glm-5.3 hy4-preview antigravity; do
             mv "$project/dist" "site/$project"
           done
           ls -R site | head -40
